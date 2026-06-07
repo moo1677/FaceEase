@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build output
+dist/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated datasets, sklearn models, and local MediaPipe assets
+output/
+data_set/
+Labeling_scaled_reworked_v2.xlsx
+
+# Keep the browser-exported model used by Vercel.
+public/models/*
+!public/models/
+!public/models/faceease_models.json
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+data_set/
+Labeling_scaled_reworked_v2.xlsx
