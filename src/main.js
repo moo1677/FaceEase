@@ -10,12 +10,26 @@ const MODEL_PATH =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
 const BROWSER_MODEL_PATH = "/models/faceease_models.json";
 const ANALYSIS_DURATION_MS = 5000;
+const CALM_BASELINE_SCALE = 0.8;
+const CALM_BASELINE_SAMPLE_LIMIT = 90;
+const CALM_BASELINE_MIN_SAMPLES = 15;
+const NEUTRAL_BASELINE_TASK_TYPE = "neutral_baseline";
+const CALM_BASELINE_KEYS = [
+  "smile",
+  "jawOpen",
+  "browActivity",
+  "mouthTension",
+  "blink",
+  "asymmetry",
+  "browDown"
+];
 
 const video = document.querySelector("#camera");
 const canvas = document.querySelector("#overlay");
 const context = canvas.getContext("2d");
 const startButton = document.querySelector("#startButton");
 const analyzeButton = document.querySelector("#analyzeButton");
+const taskTabContainer = document.querySelector(".task-tabs");
 const taskButtons = document.querySelectorAll("[data-task-type]");
 const taskPromptElement = document.querySelector("#taskPrompt");
 const snapshotButton = document.querySelector("#snapshotButton");
@@ -28,9 +42,11 @@ const naturalnessTargetInput = document.querySelector("#naturalnessTarget");
 const rigidityTargetInput = document.querySelector("#rigidityTarget");
 const feedbackList = document.querySelector("#feedbackList");
 const scoreElements = {
+  grade: document.querySelector("#naturalnessGrade"),
   naturalness: document.querySelector("#naturalnessScore"),
   task: document.querySelector("#taskScore"),
   negative: document.querySelector("#negativeScore"),
+  negativePatternProbability: document.querySelector("#negativePatternProbability"),
   serviceSampleCount: document.querySelector("#serviceSampleCount")
 };
 
@@ -51,6 +67,12 @@ export const SUMMARY_FEATURE_KEYS = [
   "baselineRigidity"
 ];
 export const POSITIVE_TASK_TYPES = ["natural_smile", "listening", "calm"];
+export const GRADE_LABELS = {
+  very_natural: "매우 자연스러움",
+  mostly_natural: "대체로 자연스러움",
+  slightly_awkward: "다소 어색함",
+  needs_improvement: "개선 필요"
+};
 export const FEEDBACK_THRESHOLDS = {
   natural_smile: {
     weakSmileMax: 0.04,
@@ -76,6 +98,7 @@ export const FEEDBACK_THRESHOLDS = {
 };
 const SAMPLE_INTERVAL_MS = 500;
 const TASK_PROMPTS = {
+  neutral_baseline: "무표정으로 얼굴 기준값을 잡아주세요",
   natural_smile: "자연스러운 미소를 지어보세요",
   listening: "경청하는 표정을 지어보세요",
   calm: "차분한 표정을 지어보세요"
@@ -101,11 +124,14 @@ let latestVariables = null;
 let isRecording = false;
 let previousBlendshapeMap = null;
 let browserModels = null;
-let selectedTaskType = "natural_smile";
+let selectedTaskType = NEUTRAL_BASELINE_TASK_TYPE;
 let isAnalyzing = false;
 let analysisStartTime = 0;
 let lastAnalysisSampleTime = 0;
+let calmBaseline = null;
+let isCollectingNeutralBaseline = false;
 const motionWindow = [];
+const calmBaselineSamples = [];
 const datasetRows = [];
 const analysisRows = [];
 
@@ -120,6 +146,7 @@ recordButton.addEventListener("click", toggleRecording);
 downloadButton.addEventListener("click", downloadCsv);
 clearButton.addEventListener("click", clearDataset);
 
+updateTaskNavigation();
 initFaceLandmarker();
 loadBrowserModels();
 
@@ -143,7 +170,7 @@ async function initFaceLandmarker() {
     startButton.disabled = false;
     statusElement.textContent = browserModels
       ? "카메라를 시작하면 분석할 수 있습니다."
-      : "회귀 모델을 불러오는 중입니다.";
+      : "분석 모델을 불러오는 중입니다.";
     updateServiceControls();
   } catch (error) {
     console.error("FaceLandmarker 초기화 실패:", error);
@@ -163,8 +190,8 @@ async function loadBrowserModels() {
       : "얼굴 인식 모델을 불러오는 중입니다.";
     updateServiceControls();
   } catch (error) {
-    console.error("브라우저 회귀 모델 로딩 실패:", error);
-    statusElement.textContent = "회귀 모델 로딩 실패. npm run ml:export를 실행했는지 확인하세요.";
+    console.error("브라우저 분석 모델 로딩 실패:", error);
+    statusElement.textContent = "분석 모델 로딩 실패. npm run ml:export를 실행했는지 확인하세요.";
   }
 }
 
@@ -189,7 +216,7 @@ async function startCamera() {
 
     isRunning = true;
     startButton.disabled = true;
-    statusElement.textContent = "얼굴을 인식하면 5초 분석을 시작할 수 있습니다.";
+    statusElement.textContent = "무표정 버튼을 눌러 얼굴 기준값 수집을 시작하세요.";
     updateServiceControls();
     requestAnimationFrame(renderLoop);
     return true;
@@ -240,7 +267,7 @@ function drawResult(result) {
     return;
   }
 
-  if (!isAnalyzing) {
+  if (!isAnalyzing && selectedTaskType !== NEUTRAL_BASELINE_TASK_TYPE) {
     statusElement.textContent = "얼굴 인식 중입니다. 5초 분석을 시작할 수 있습니다.";
   }
   drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, {
@@ -271,7 +298,14 @@ function processResult(result) {
   const blendshapes = Object.fromEntries(
     categories.map((category) => [category.categoryName, category.score])
   );
-  const variables = calculateExpressionVariables(blendshapes);
+
+  if (isCollectingNeutralBaseline && !isAnalyzing) {
+    updateCalmBaseline(calculateCalmBaselineValues(blendshapes));
+  }
+
+  const variables = calculateExpressionVariables(blendshapes, {
+    calmBaseline: hasCalmBaseline() ? calmBaseline : null
+  });
   latestVariables = variables;
 
   updateMetrics(variables);
@@ -305,12 +339,42 @@ function processResult(result) {
 }
 
 function selectTaskType(taskType) {
+  if (taskType === NEUTRAL_BASELINE_TASK_TYPE) {
+    startNeutralBaselineCollection();
+    return;
+  }
+
+  if (taskType !== NEUTRAL_BASELINE_TASK_TYPE && !hasCalmBaseline()) {
+    selectedTaskType = NEUTRAL_BASELINE_TASK_TYPE;
+    taskPromptElement.textContent = TASK_PROMPTS[NEUTRAL_BASELINE_TASK_TYPE];
+    statusElement.textContent = "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡아주세요.";
+    updateTaskNavigation();
+    resetServiceResult();
+    return;
+  }
+
   selectedTaskType = taskType;
   taskPromptElement.textContent = TASK_PROMPTS[taskType];
-  taskButtons.forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.taskType === taskType);
-  });
+  updateTaskNavigation();
   resetServiceResult();
+}
+
+function startNeutralBaselineCollection() {
+  if (!isRunning) {
+    statusElement.textContent = "카메라를 먼저 시작하세요.";
+    return;
+  }
+
+  selectedTaskType = NEUTRAL_BASELINE_TASK_TYPE;
+  taskPromptElement.textContent = TASK_PROMPTS[NEUTRAL_BASELINE_TASK_TYPE];
+  calmBaseline = null;
+  calmBaselineSamples.length = 0;
+  isCollectingNeutralBaseline = true;
+  resetExpressionState();
+  resetServiceResult();
+  statusElement.textContent = "무표정을 유지하세요. 얼굴 기준값을 수집합니다.";
+  updateTaskNavigation();
+  updateServiceControls();
 }
 
 async function startServiceAnalysis() {
@@ -325,6 +389,16 @@ async function startServiceAnalysis() {
     }
   }
 
+  if (!hasCalmBaseline()) {
+    statusElement.textContent = "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡은 뒤 분석하세요.";
+    return;
+  }
+
+  if (selectedTaskType === NEUTRAL_BASELINE_TASK_TYPE) {
+    selectTaskType("natural_smile");
+    return;
+  }
+
   resetExpressionState();
   analysisRows.length = 0;
   isAnalyzing = true;
@@ -333,7 +407,7 @@ async function startServiceAnalysis() {
   progressElement.style.width = "0%";
   scoreElements.serviceSampleCount.textContent = "0";
   feedbackList.innerHTML = "<li>분석 중입니다.</li>";
-  setScoreText("--", "--", "--");
+  setScoreText("--", "--", "--", "--", "--");
   updateServiceControls();
 }
 
@@ -367,63 +441,62 @@ function finishServiceAnalysis() {
   }
 
   const summaryFeatures = summarizeFrameVariables(analysisRows);
-  const predictedTaskPerformanceScore = predictModel(browserModels.taskModel, {
+  const predictedScore = predictModel(browserModels.scoreModel, {
     taskType: selectedTaskType,
     summaryFeatures
   });
-  const predictedNegativeExpressionScore = predictModel(browserModels.negativeModel, {
-    taskType: selectedTaskType,
-    summaryFeatures
-  });
-  const finalNaturalnessScore = calculateFinalNaturalnessScore(
-    selectedTaskType,
-    predictedTaskPerformanceScore,
-    predictedNegativeExpressionScore
-  );
+  const naturalnessGrade = gradeFromScore(predictedScore);
   const feedback = generateTaskFeedback({
     taskType: selectedTaskType,
-    predictedTaskPerformanceScore,
-    predictedNegativeExpressionScore,
-    finalNaturalnessScore,
+    predictedScore,
+    naturalnessGrade,
     summaryFeatures
   });
 
   setScoreText(
-    formatScore(finalNaturalnessScore),
-    formatScore(predictedTaskPerformanceScore),
-    formatScore(predictedNegativeExpressionScore)
+    formatGrade(naturalnessGrade),
+    formatScore(predictedScore),
+    "score",
+    selectedTaskType === "awkward" || selectedTaskType === "over_smile" ? "부정 계열" : "일반 계열",
+    browserModels.scoreModel.modelName
   );
   feedbackList.innerHTML = feedback.map((message) => `<li>${escapeHtml(message)}</li>`).join("");
   statusElement.textContent = "분석 완료";
   progressElement.style.width = "100%";
   console.log("faceease_service_result", {
     taskType: selectedTaskType,
-    predictedTaskPerformanceScore,
-    predictedNegativeExpressionScore,
-    finalNaturalnessScore,
+    predictedScore,
+    naturalnessGrade,
     summaryFeatures,
     feedback
   });
 }
 
 function updateServiceControls() {
-  analyzeButton.disabled = !faceLandmarker || !browserModels || isAnalyzing;
+  analyzeButton.disabled =
+    !faceLandmarker ||
+    !browserModels ||
+    isAnalyzing ||
+    !hasCalmBaseline() ||
+    selectedTaskType === NEUTRAL_BASELINE_TASK_TYPE;
   taskButtons.forEach((button) => {
     button.disabled = isAnalyzing;
   });
 }
 
 function resetServiceResult() {
-  setScoreText("--", "--", "--");
+  setScoreText("--", "--", "--", "--", "--");
   scoreElements.serviceSampleCount.textContent = "0";
   feedbackList.innerHTML = "<li>분석 결과가 여기에 표시됩니다.</li>";
   progressElement.style.width = "0%";
 }
 
-function setScoreText(naturalness, task, negative) {
+function setScoreText(grade, naturalness, task, negative, negativePatternProbability) {
+  scoreElements.grade.textContent = grade;
   scoreElements.naturalness.textContent = naturalness;
   scoreElements.task.textContent = task;
   scoreElements.negative.textContent = negative;
+  scoreElements.negativePatternProbability.textContent = negativePatternProbability;
 }
 
 function predictModel(model, { taskType, summaryFeatures }) {
@@ -445,19 +518,89 @@ function predictModel(model, { taskType, summaryFeatures }) {
   return clampScore(prediction);
 }
 
+function predictClassifierProbabilities(model, { taskType, summaryFeatures }) {
+  const input = buildModelInput(model, taskType, summaryFeatures);
+
+  if (model.kind === "logisticClassifier") {
+    return logisticProbabilities(model, input);
+  }
+
+  if (model.kind === "randomForestClassifier") {
+    const summed = model.trees.reduce((totals, tree) => {
+      const probabilities = normalizeProbabilities(predictTree(tree, input));
+      return totals.map((total, index) => total + (probabilities[index] ?? 0));
+    }, model.classes.map(() => 0));
+    return probabilitiesByClass(model.classes, normalizeProbabilities(summed));
+  }
+
+  if (model.kind === "gradientBoostingClassifier") {
+    return gradientBoostingClassifierProbabilities(model, input);
+  }
+
+  return probabilitiesByClass(model.classes ?? [], []);
+}
+
+function logisticProbabilities(model, input) {
+  if (model.classes.length === 2 && model.coef.length === 1) {
+    const raw = model.intercept[0] + model.coef[0].reduce((sum, coefficient, index) => {
+      return sum + coefficient * input[index];
+    }, 0);
+    const positiveProbability = sigmoid(raw);
+    return probabilitiesByClass(model.classes, [1 - positiveProbability, positiveProbability]);
+  }
+
+  const rawScores = model.coef.map((coefficients, classIndex) => {
+    return model.intercept[classIndex] + coefficients.reduce((sum, coefficient, featureIndex) => {
+      return sum + coefficient * input[featureIndex];
+    }, 0);
+  });
+  return probabilitiesByClass(model.classes, softmax(rawScores));
+}
+
+function gradientBoostingClassifierProbabilities(model, input) {
+  if (model.classes.length === 2) {
+    const raw = model.initialRawPredictions[0] +
+      model.learningRate * model.trees.reduce((sum, tree) => sum + predictTree(tree, input), 0);
+    const positiveProbability = sigmoid(raw);
+    return probabilitiesByClass(model.classes, [1 - positiveProbability, positiveProbability]);
+  }
+
+  const rawScores = [...model.initialRawPredictions];
+  model.trees.forEach((stage) => {
+    stage.forEach((tree, classIndex) => {
+      rawScores[classIndex] += model.learningRate * predictTree(tree, input);
+    });
+  });
+  return probabilitiesByClass(model.classes, softmax(rawScores));
+}
+
 function buildModelInput(model, taskType, summaryFeatures) {
   const values = [];
+  const row = {
+    taskType,
+    ...summaryFeatures
+  };
 
-  if (model.includeTaskType) {
+  if (model.categoricalFeatureColumns?.length) {
+    model.categoricalFeatureColumns.forEach((column) => {
+      const categories = model.categoricalCategories?.[column] ?? [];
+      categories.forEach((category) => {
+        values.push(String(category) === String(row[column] ?? "") ? 1 : 0);
+      });
+    });
+  } else if (model.includeTaskType && model.taskTypeCategories) {
     model.taskTypeCategories.forEach((category) => {
       values.push(category === taskType ? 1 : 0);
     });
   }
 
-  model.featureColumns.forEach((column, index) => {
-    const rawValue = Number(summaryFeatures[column] ?? 0);
-    const scale = model.featureScaler.scale[index] || 1;
-    values.push((rawValue - model.featureScaler.mean[index]) / scale);
+  const numericColumns = model.numericFeatureColumns ?? model.featureColumns;
+  const scaler = model.numericScaler ?? model.featureScaler;
+  numericColumns.forEach((column, index) => {
+    const rawValue = Number(row[column] ?? 0);
+    const scale = scaler?.scale?.[index] || 1;
+    const mean = scaler?.mean?.[index] || 0;
+    values.push((rawValue - mean) / scale);
   });
 
   return values;
@@ -476,39 +619,50 @@ function predictTree(tree, input) {
   return tree.value[node];
 }
 
-export function calculateExpressionVariables(blendshapes) {
-  const smileLeft = score(blendshapes, "mouthSmileLeft");
-  const smileRight = score(blendshapes, "mouthSmileRight");
-  const jawOpen = score(blendshapes, "jawOpen");
-  const mouthPress = average([
-    score(blendshapes, "mouthPressLeft"),
-    score(blendshapes, "mouthPressRight")
-  ]);
-  const mouthPucker = score(blendshapes, "mouthPucker");
-  const mouthFunnel = score(blendshapes, "mouthFunnel");
-  const browUp = score(blendshapes, "browInnerUp");
-  const browDown = average([
-    score(blendshapes, "browDownLeft"),
-    score(blendshapes, "browDownRight")
-  ]);
-  const eyeBlinkLeft = score(blendshapes, "eyeBlinkLeft");
-  const eyeBlinkRight = score(blendshapes, "eyeBlinkRight");
+function probabilitiesByClass(classes, probabilities) {
+  return Object.fromEntries(
+    classes.map((className, index) => [String(className), clampProbability(probabilities[index] ?? 0)])
+  );
+}
 
+function normalizeProbabilities(values) {
+  const numbers = values.map((value) => Number(value) || 0);
+  const total = numbers.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) {
+    return numbers.map(() => 1 / Math.max(1, numbers.length));
+  }
+  return numbers.map((value) => value / total);
+}
+
+function topProbabilityClass(probabilities) {
+  return Object.entries(probabilities).reduce((best, current) => {
+    return current[1] > best[1] ? current : best;
+  }, ["normal", -1])[0];
+}
+
+export function calculateExpressionVariables(blendshapes, options = {}) {
+  const raw = calculateCalmBaselineValues(blendshapes);
+  const smile = adjustForCalmBaseline("smile", raw.smile, options.calmBaseline);
+  const jawOpen = adjustForCalmBaseline("jawOpen", raw.jawOpen, options.calmBaseline);
+  const browActivity = adjustForCalmBaseline(
+    "browActivity",
+    raw.browActivity,
+    options.calmBaseline
+  );
+  const mouthTension = adjustForCalmBaseline(
+    "mouthTension",
+    raw.mouthTension,
+    options.calmBaseline
+  );
+  const blink = adjustForCalmBaseline("blink", raw.blink, options.calmBaseline);
+  const asymmetry = adjustForCalmBaseline("asymmetry", raw.asymmetry, options.calmBaseline);
+  const browDown = adjustForCalmBaseline("browDown", raw.browDown, options.calmBaseline);
   const frameMotion = getFrameMotion(blendshapes);
   motionWindow.push(frameMotion);
   if (motionWindow.length > 24) {
     motionWindow.shift();
   }
 
-  const smile = average([smileLeft, smileRight]);
-  const blink = average([eyeBlinkLeft, eyeBlinkRight]);
-  const mouthTension = clamp01(mouthPress * 0.75 + mouthPucker * 0.15 + mouthFunnel * 0.1);
-  const asymmetry = clamp01(
-    Math.abs(smileLeft - smileRight) * 0.55 +
-      Math.abs(eyeBlinkLeft - eyeBlinkRight) * 0.25 +
-      Math.abs(score(blendshapes, "browOuterUpLeft") - score(blendshapes, "browOuterUpRight")) * 0.2
-  );
-  const browActivity = clamp01(browUp * 0.55 + browDown * 0.45);
   const expressionActivity = clamp01(
     smile * 0.3 + jawOpen * 0.2 + browActivity * 0.2 + blink * 0.12 + mouthTension * 0.18
   );
@@ -536,6 +690,92 @@ export function calculateExpressionVariables(blendshapes) {
     jawOpen: round(jawOpen),
     browActivity: round(browActivity)
   };
+}
+
+function calculateCalmBaselineValues(blendshapes) {
+  const smileLeft = score(blendshapes, "mouthSmileLeft");
+  const smileRight = score(blendshapes, "mouthSmileRight");
+  const jawOpen = score(blendshapes, "jawOpen");
+  const mouthPress = average([
+    score(blendshapes, "mouthPressLeft"),
+    score(blendshapes, "mouthPressRight")
+  ]);
+  const mouthPucker = score(blendshapes, "mouthPucker");
+  const mouthFunnel = score(blendshapes, "mouthFunnel");
+  const browUp = score(blendshapes, "browInnerUp");
+  const browDown = average([
+    score(blendshapes, "browDownLeft"),
+    score(blendshapes, "browDownRight")
+  ]);
+  const eyeBlinkLeft = score(blendshapes, "eyeBlinkLeft");
+  const eyeBlinkRight = score(blendshapes, "eyeBlinkRight");
+
+  const smile = average([smileLeft, smileRight]);
+  const blink = average([eyeBlinkLeft, eyeBlinkRight]);
+  const mouthTension = clamp01(mouthPress * 0.75 + mouthPucker * 0.15 + mouthFunnel * 0.1);
+  const asymmetry = clamp01(
+    Math.abs(smileLeft - smileRight) * 0.55 +
+      Math.abs(eyeBlinkLeft - eyeBlinkRight) * 0.25 +
+      Math.abs(score(blendshapes, "browOuterUpLeft") - score(blendshapes, "browOuterUpRight")) * 0.2
+  );
+  const browActivity = clamp01(browUp * 0.55 + browDown * 0.45);
+
+  return {
+    smile,
+    jawOpen,
+    browActivity,
+    mouthTension,
+    blink,
+    asymmetry,
+    browDown
+  };
+}
+
+function updateCalmBaseline(values) {
+  calmBaselineSamples.push(values);
+  if (calmBaselineSamples.length > CALM_BASELINE_SAMPLE_LIMIT) {
+    calmBaselineSamples.shift();
+  }
+
+  calmBaseline = Object.fromEntries(
+    CALM_BASELINE_KEYS.map((key) => [key, average(calmBaselineSamples.map((sample) => sample[key] ?? 0))])
+  );
+
+  if (hasCalmBaseline()) {
+    isCollectingNeutralBaseline = false;
+    if (selectedTaskType === NEUTRAL_BASELINE_TASK_TYPE) {
+      selectTaskType("natural_smile");
+      statusElement.textContent = "얼굴 기준값이 잡혔습니다. 분석할 표정을 선택하세요.";
+    }
+  } else {
+    statusElement.textContent = `무표정 기준값을 잡는 중입니다. ${calmBaselineSamples.length}/${CALM_BASELINE_MIN_SAMPLES}`;
+  }
+
+  updateTaskNavigation();
+  updateServiceControls();
+}
+
+function adjustForCalmBaseline(key, value, baseline) {
+  if (!baseline) {
+    return clamp01(value);
+  }
+
+  return clamp01(value - (baseline[key] ?? 0) * CALM_BASELINE_SCALE);
+}
+
+function hasCalmBaseline() {
+  return Boolean(calmBaseline && calmBaselineSamples.length >= CALM_BASELINE_MIN_SAMPLES);
+}
+
+function updateTaskNavigation() {
+  const baselineReady = hasCalmBaseline();
+  taskTabContainer.classList.toggle("is-baseline-mode", !baselineReady);
+
+  taskButtons.forEach((button) => {
+    const isBaselineTask = button.dataset.taskType === NEUTRAL_BASELINE_TASK_TYPE;
+    button.classList.toggle("is-hidden", baselineReady ? isBaselineTask : !isBaselineTask);
+    button.classList.toggle("is-active", button.dataset.taskType === selectedTaskType);
+  });
 }
 
 function getFrameMotion(blendshapes) {
@@ -630,6 +870,11 @@ function collectSample() {
 
   if (!latestVariables || !targets) {
     statusElement.textContent = "얼굴 인식 후 자연도/경직도 라벨을 0-100으로 입력하세요.";
+    return;
+  }
+
+  if (!hasCalmBaseline()) {
+    statusElement.textContent = "먼저 무표정으로 얼굴 기준값을 잡은 뒤 수집하세요.";
     return;
   }
 
@@ -736,6 +981,21 @@ function clamp01(value) {
   return Math.min(1, Math.max(0, value));
 }
 
+function clampProbability(value) {
+  return Math.min(1, Math.max(0, Number(value) || 0));
+}
+
+function sigmoid(value) {
+  return 1 / (1 + Math.exp(-value));
+}
+
+function softmax(values) {
+  const maxValue = Math.max(...values);
+  const exponentials = values.map((value) => Math.exp(value - maxValue));
+  const total = exponentials.reduce((sum, value) => sum + value, 0);
+  return exponentials.map((value) => value / total);
+}
+
 function round(value) {
   return Math.round(value * 1000) / 1000;
 }
@@ -746,6 +1006,31 @@ function formatScore(value) {
   }
 
   return String(Math.round(value));
+}
+
+function formatGrade(value) {
+  return GRADE_LABELS[value] ?? "--";
+}
+
+function gradeFromScore(value) {
+  if (value >= 80) {
+    return "very_natural";
+  }
+  if (value >= 60) {
+    return "mostly_natural";
+  }
+  if (value >= 40) {
+    return "slightly_awkward";
+  }
+  return "needs_improvement";
+}
+
+function formatProbability(value) {
+  if (!Number.isFinite(value)) {
+    return "--";
+  }
+
+  return `${Math.round(value * 100)}%`;
 }
 
 function escapeHtml(value) {
@@ -796,31 +1081,20 @@ export function calculateFinalNaturalnessScore(
 
 export function generateTaskFeedback({
   taskType,
-  predictedTaskPerformanceScore,
-  predictedNegativeExpressionScore,
-  finalNaturalnessScore,
+  predictedScore,
+  naturalnessGrade,
   summaryFeatures
 }) {
   const messages = [];
   const mean = (key) => Number(summaryFeatures?.[`mean_${key}`] ?? 0);
   const std = (key) => Number(summaryFeatures?.[`std_${key}`] ?? 0);
 
-  if (
-    POSITIVE_TASK_TYPES.includes(taskType) &&
-    finalNaturalnessScore !== null &&
-    finalNaturalnessScore >= 75 &&
-    predictedTaskPerformanceScore >= 75 &&
-    predictedNegativeExpressionScore <= 35
-  ) {
-    return ["현재 표정은 선택한 과제와 비교적 잘 맞고 부정 표정 신호도 낮게 나타났습니다."];
+  if (naturalnessGrade) {
+    messages.push(`score 기준 등급은 ${formatGrade(naturalnessGrade)}입니다.`);
   }
 
-  if (predictedTaskPerformanceScore < 55) {
-    messages.push("요청된 표정 과제 수행도가 낮아 목표 표정이 명확하게 전달되지 않을 수 있습니다.");
-  }
-
-  if (predictedNegativeExpressionScore > 65) {
-    messages.push("어색하거나 과하게 웃는 부정 표정 패턴과 유사도가 높게 나타났습니다.");
+  if (predictedScore < 55) {
+    messages.push("최종 자연스러움 score가 낮아 과제 수행 또는 부정 패턴 보정 측면의 개선이 필요합니다.");
   }
 
   if (taskType === "natural_smile") {
@@ -875,11 +1149,11 @@ export function generateTaskFeedback({
       messages.push("표정 변화가 지나치게 크면 차분한 기본 표정과 다르게 보일 수 있습니다.");
     }
   } else if (taskType === "awkward" || taskType === "over_smile") {
-    messages.push("awkward와 over_smile은 서비스 권장 과제가 아니라 부정 패턴 학습용 taskType입니다.");
+    messages.push("awkward와 over_smile은 어색한표정과 과하게웃는표정 부정 패턴 계열입니다.");
   }
 
-  if (!messages.length && finalNaturalnessScore !== null) {
-    messages.push("현재 표정은 선택한 과제와 비교적 잘 맞고 부정 표정 신호도 낮게 나타났습니다.");
+  if (!messages.length && Number.isFinite(predictedScore)) {
+    messages.push("현재 표정은 선택한 과제와 비교적 잘 맞는 score로 예측되었습니다.");
   }
 
   return messages.slice(0, 4);

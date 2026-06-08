@@ -156,12 +156,20 @@ canvas {
   padding: 4px;
 }
 
+.task-tabs.is-baseline-mode {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .task-tab {
   min-height: 38px;
   border-radius: 6px;
   background: transparent;
   color: #526170;
   padding: 0 8px;
+}
+
+.task-tab.is-hidden {
+  display: none;
 }
 
 .task-tab.is-active {
@@ -220,6 +228,16 @@ canvas {
   color: #17202a;
   font-size: 34px;
   line-height: 1;
+}
+
+.score-grid .grade-card {
+  grid-column: 1 / -1;
+}
+
+.score-grid .grade-result {
+  font-size: 26px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
 }
 
 .feedback-panel ul {

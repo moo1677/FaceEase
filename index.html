@@ -28,30 +28,39 @@
           <p id="status">모델을 불러오는 중...</p>
 
           <div class="task-tabs" role="group" aria-label="표정 과제 선택">
-            <button class="task-tab is-active" type="button" data-task-type="natural_smile">미소</button>
+            <button class="task-tab is-active" type="button" data-task-type="neutral_baseline">무표정</button>
+            <button class="task-tab" type="button" data-task-type="natural_smile">미소</button>
             <button class="task-tab" type="button" data-task-type="listening">경청</button>
             <button class="task-tab" type="button" data-task-type="calm">차분</button>
           </div>
 
           <div class="task-card">
             <span>선택 과제</span>
-            <strong id="taskPrompt">자연스러운 미소를 지어보세요</strong>
+            <strong id="taskPrompt">무표정으로 얼굴 기준값을 잡아주세요</strong>
           </div>
 
           <button id="analyzeButton" class="primary-action" type="button" disabled>5초 분석 시작</button>
 
           <div class="score-grid">
+            <div class="grade-card">
+              <span>score 등급</span>
+              <strong id="naturalnessGrade" class="grade-result">--</strong>
+            </div>
             <div>
-              <span>자연도</span>
+              <span>예측 score</span>
               <strong id="naturalnessScore">--</strong>
             </div>
             <div>
-              <span>과제 수행</span>
+              <span>학습 target</span>
               <strong id="taskScore">--</strong>
             </div>
             <div>
-              <span>부정 패턴</span>
+              <span>taskType 계열</span>
               <strong id="negativeScore">--</strong>
+            </div>
+            <div>
+              <span>선택 모델</span>
+              <strong id="negativePatternProbability">--</strong>
             </div>
             <div>
               <span>샘플</span>

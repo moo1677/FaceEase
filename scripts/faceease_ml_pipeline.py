@@ -19,17 +19,31 @@ import pandas as pd
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import GroupKFold
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    precision_score,
+    r2_score,
+    recall_score,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data_set"
-DEFAULT_LABEL_FILE = ROOT / "Labeling_scaled_reworked_v2.xlsx"
+DEFAULT_LABEL_FILE = ROOT / "Labeling.xlsx"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -45,6 +59,32 @@ TASK_SUFFIXES = {
 }
 POSITIVE_TASKS = {"natural_smile", "listening", "calm"}
 NEGATIVE_TASKS = {"awkward", "over_smile"}
+NATURALNESS_BINARY_LABELS = ["needs_improvement", "natural"]
+NATURALNESS_LEVEL_LABELS = [
+    "needs_improvement",
+    "slightly_awkward",
+    "mostly_natural",
+    "very_natural",
+]
+NATURALNESS_LEVEL_DISPLAY_TEXT = {
+    "needs_improvement": "개선 필요",
+    "slightly_awkward": "다소 어색함",
+    "mostly_natural": "대체로 자연스러움",
+    "very_natural": "매우 자연스러움",
+}
+NEGATIVE_PATTERN_LABELS = [0, 1]
+BOUNDARY_AMBIGUOUS_RANGES = ((38.0, 42.0), (58.0, 62.0), (78.0, 82.0))
+CALM_BASELINE_TASK_TYPE = "calm"
+CALM_BASELINE_SCALE = 0.8
+CALM_BASELINE_FEATURE_KEYS = (
+    "smile",
+    "jawOpen",
+    "browActivity",
+    "mouthTension",
+    "blink",
+    "asymmetry",
+    "browDown",
+)
 
 FRAME_FEATURE_KEYS = [
     "expressionActivity",
@@ -78,12 +118,38 @@ LABEL_COLUMNS = [
     "userId",
     "videoName",
     "taskType",
+    "score",
+]
+RAW_LABEL_COLUMNS = ["영상번호", "표정", "avg"]
+TARGET_COLUMN = "score"
+SCORE_DEFINITION = "score = task performance score - negative pattern penalty"
+NEGATIVE_PATTERN_DEFINITION = {
+    "negativePatterns": ["awkward", "over_smile"],
+    "description": "어색한표정과 과하게웃는표정을 부정점수 보정 기준으로 사용",
+}
+PRESENTATION_SUMMARY = [
+    "Labeling.xlsx의 score 컬럼을 최종 자연스러움 점수로 사용하였다.",
+    "score는 과제수행 정도에서 어색한표정과 과하게웃는표정에 따른 부정점수를 보정한 값으로 해석하였다.",
+    "본 프로젝트는 복잡한 다중 분류 구조 대신 score 예측 회귀 모델을 중심으로 단순화하였다.",
+    "모델 성능은 MAE, RMSE, R²를 통해 평가하였다.",
+]
+NON_FEATURE_COLUMNS = {
+    "userId",
+    "videoName",
+    "_joinKey",
+    "sampleId",
+    "timestampIso",
+    "reviewNeeded",
     "taskPerformanceScore",
     "negativeExpressionScore",
     "finalNaturalnessScore",
     "rigidityScore",
-    "reviewNeeded",
-]
+    "naturalnessBinaryLabel",
+    "naturalnessLevel",
+    "boundaryAmbiguous",
+    "negative_pattern",
+    TARGET_COLUMN,
+}
 
 
 def normalize_text(value: Any) -> str:
@@ -136,13 +202,15 @@ def round3(value: float) -> float:
 
 @dataclass
 class ExpressionFeatureCalculator:
+    calm_baseline: dict[str, float] | None = None
+    baseline_scale: float = CALM_BASELINE_SCALE
     previous_blendshape_map: dict[str, float] | None = None
     motion_window: list[float] = field(default_factory=list)
 
     def calculate(self, blendshapes: dict[str, float]) -> dict[str, float]:
         smile_left = score(blendshapes, "mouthSmileLeft")
         smile_right = score(blendshapes, "mouthSmileRight")
-        jaw_open = score(blendshapes, "jawOpen")
+        raw_jaw_open = score(blendshapes, "jawOpen")
         mouth_press = average(
             [score(blendshapes, "mouthPressLeft"), score(blendshapes, "mouthPressRight")]
         )
@@ -158,22 +226,29 @@ class ExpressionFeatureCalculator:
         if len(self.motion_window) > 24:
             self.motion_window.pop(0)
 
-        smile = average([smile_left, smile_right])
-        blink = average([eye_blink_left, eye_blink_right])
-        mouth_tension = clamp01(mouth_press * 0.75 + mouth_pucker * 0.15 + mouth_funnel * 0.1)
-        asymmetry = clamp01(
+        raw_smile = average([smile_left, smile_right])
+        raw_blink = average([eye_blink_left, eye_blink_right])
+        raw_mouth_tension = clamp01(mouth_press * 0.75 + mouth_pucker * 0.15 + mouth_funnel * 0.1)
+        raw_asymmetry = clamp01(
             abs(smile_left - smile_right) * 0.55
             + abs(eye_blink_left - eye_blink_right) * 0.25
             + abs(score(blendshapes, "browOuterUpLeft") - score(blendshapes, "browOuterUpRight")) * 0.2
         )
-        brow_activity = clamp01(brow_up * 0.55 + brow_down * 0.45)
+        raw_brow_activity = clamp01(brow_up * 0.55 + brow_down * 0.45)
+        smile = self.adjust_for_calm_baseline("smile", raw_smile)
+        jaw_open = self.adjust_for_calm_baseline("jawOpen", raw_jaw_open)
+        brow_activity = self.adjust_for_calm_baseline("browActivity", raw_brow_activity)
+        mouth_tension = self.adjust_for_calm_baseline("mouthTension", raw_mouth_tension)
+        blink = self.adjust_for_calm_baseline("blink", raw_blink)
+        asymmetry = self.adjust_for_calm_baseline("asymmetry", raw_asymmetry)
+        adjusted_brow_down = self.adjust_for_calm_baseline("browDown", brow_down)
         expression_activity = clamp01(
             smile * 0.3 + jaw_open * 0.2 + brow_activity * 0.2 + blink * 0.12 + mouth_tension * 0.18
         )
         motion_average = average(self.motion_window)
 
         stillness = 1 - clamp01(motion_average / 0.035)
-        tension_signal = clamp01(mouth_tension * 0.65 + brow_down * 0.2 + asymmetry * 0.15)
+        tension_signal = clamp01(mouth_tension * 0.65 + adjusted_brow_down * 0.2 + asymmetry * 0.15)
         baseline_rigidity = round(clamp01(stillness * 0.58 + tension_signal * 0.42) * 100)
         baseline_naturalness = round(
             clamp01(0.72 - baseline_rigidity / 170 + expression_activity * 0.28 - asymmetry * 0.18) * 100
@@ -193,7 +268,13 @@ class ExpressionFeatureCalculator:
             "smile": round3(smile),
             "jawOpen": round3(jaw_open),
             "browActivity": round3(brow_activity),
+            "browDown": round3(adjusted_brow_down),
         }
+
+    def adjust_for_calm_baseline(self, key: str, value: float) -> float:
+        if not self.calm_baseline:
+            return clamp01(value)
+        return clamp01(value - self.calm_baseline.get(key, 0.0) * self.baseline_scale)
 
     def get_frame_motion(self, blendshapes: dict[str, float]) -> float:
         if self.previous_blendshape_map is None:
@@ -264,26 +345,13 @@ def detect_blendshapes(landmarker: Any, frame_bgr: np.ndarray) -> dict[str, floa
     return {category.category_name: float(category.score) for category in categories}
 
 
-def summarize_features(frame_features: list[dict[str, float]]) -> dict[str, float]:
-    summary: dict[str, float] = {}
-    for key in FRAME_FEATURE_KEYS:
-        values = np.array([row[key] for row in frame_features if key in row], dtype=float)
-        if values.size == 0:
-            summary[f"mean_{key}"] = np.nan
-            summary[f"std_{key}"] = np.nan
-            continue
-        summary[f"mean_{key}"] = round(float(values.mean()), 6)
-        summary[f"std_{key}"] = round(float(values.std(ddof=0)), 6)
-    return summary
-
-
-def extract_video_summary(
+def extract_video_frame_features(
     video_path: Path,
     landmarker: Any,
     interval_seconds: float,
-) -> dict[str, Any]:
-    meta = parse_video_name(video_path)
-    calculator = ExpressionFeatureCalculator()
+    calm_baseline: dict[str, float] | None = None,
+) -> list[dict[str, float]]:
+    calculator = ExpressionFeatureCalculator(calm_baseline=calm_baseline)
     frame_features: list[dict[str, float]] = []
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -301,11 +369,66 @@ def extract_video_summary(
     finally:
         cap.release()
 
+    return frame_features
+
+
+def summarize_calm_baseline(frame_features: list[dict[str, float]]) -> dict[str, float]:
+    baseline: dict[str, float] = {}
+    for key in CALM_BASELINE_FEATURE_KEYS:
+        values = np.array([row[key] for row in frame_features if key in row], dtype=float)
+        baseline[key] = round(float(values.mean()), 6) if values.size else 0.0
+    return baseline
+
+
+def build_calm_baselines(
+    video_paths: list[Path],
+    landmarker: Any,
+    interval_seconds: float,
+) -> dict[str, dict[str, float]]:
+    baselines: dict[str, dict[str, float]] = {}
+    calm_paths = []
+    for video_path in video_paths:
+        meta = parse_video_name(video_path)
+        if meta["taskType"] == CALM_BASELINE_TASK_TYPE:
+            calm_paths.append((meta, video_path))
+
+    for index, (meta, video_path) in enumerate(calm_paths, start=1):
+        print(f"[baseline {index}/{len(calm_paths)}] Extracting {normalize_text(video_path.name)}")
+        raw_features = extract_video_frame_features(video_path, landmarker, interval_seconds)
+        if raw_features:
+            baselines[meta["userId"]] = summarize_calm_baseline(raw_features)
+
+    return baselines
+
+
+def summarize_features(frame_features: list[dict[str, float]]) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    for key in FRAME_FEATURE_KEYS:
+        values = np.array([row[key] for row in frame_features if key in row], dtype=float)
+        if values.size == 0:
+            summary[f"mean_{key}"] = np.nan
+            summary[f"std_{key}"] = np.nan
+            continue
+        summary[f"mean_{key}"] = round(float(values.mean()), 6)
+        summary[f"std_{key}"] = round(float(values.std(ddof=0)), 6)
+    return summary
+
+
+def extract_video_summary(
+    video_path: Path,
+    landmarker: Any,
+    interval_seconds: float,
+    calm_baseline: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    meta = parse_video_name(video_path)
+    frame_features = extract_video_frame_features(video_path, landmarker, interval_seconds, calm_baseline)
+
     row: dict[str, Any] = {
         "userId": meta["userId"],
         "videoName": meta["videoName"],
         "taskType": meta["taskType"],
         "sampleCount": len(frame_features),
+        "calmBaselineScale": CALM_BASELINE_SCALE if calm_baseline else 0.0,
     }
     row.update(summarize_features(frame_features))
     row["_joinKey"] = meta["joinKey"]
@@ -318,30 +441,95 @@ def build_summary_dataset(data_dir: Path, output_dir: Path, model_path: Path, in
         raise FileNotFoundError(f"No mp4 files found in {data_dir}")
 
     rows: list[dict[str, Any]] = []
+    output_dir.mkdir(parents=True, exist_ok=True)
     with create_landmarker(model_path) as landmarker:
+        calm_baselines = build_calm_baselines(video_paths, landmarker, interval_seconds)
+        (output_dir / "faceease_calm_baselines.json").write_text(
+            json.dumps(json_safe(calm_baselines), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
         for index, video_path in enumerate(video_paths, start=1):
+            meta = parse_video_name(video_path)
+            calm_baseline = calm_baselines.get(meta["userId"])
             print(f"[{index}/{len(video_paths)}] Extracting {normalize_text(video_path.name)}")
-            rows.append(extract_video_summary(video_path, landmarker, interval_seconds))
+            rows.append(extract_video_summary(video_path, landmarker, interval_seconds, calm_baseline))
 
     summary = pd.DataFrame(rows)
     public_summary = summary.drop(columns=["_joinKey"])
-    output_dir.mkdir(parents=True, exist_ok=True)
     public_summary.to_csv(output_dir / "faceease_dataset_summary.csv", index=False, encoding="utf-8-sig")
     return summary
 
 
 def load_labels(label_file: Path) -> pd.DataFrame:
-    labels = pd.read_excel(label_file, sheet_name="Scaled_Label")
-    missing = [column for column in LABEL_COLUMNS if column not in labels.columns]
-    if missing:
-        raise ValueError(f"Scaled_Label is missing columns: {missing}")
+    excel = pd.ExcelFile(label_file)
+    score_sheet = next(
+        (
+            sheet_name
+            for sheet_name in excel.sheet_names
+            if TARGET_COLUMN in pd.read_excel(label_file, sheet_name=sheet_name, nrows=0).columns
+        ),
+        None,
+    )
 
-    labels = labels[LABEL_COLUMNS].copy()
-    labels["_joinKey"] = labels["videoName"].map(join_key)
-    labels["userId"] = labels["userId"].map(normalize_text)
-    labels["videoName"] = labels["videoName"].map(normalize_text)
-    labels["taskType"] = labels["taskType"].map(normalize_text)
+    if score_sheet:
+        labels = pd.read_excel(label_file, sheet_name=score_sheet)
+    elif "Raw_Clean" in excel.sheet_names:
+        raw = pd.read_excel(label_file, sheet_name="Raw_Clean")
+        missing_raw = [column for column in RAW_LABEL_COLUMNS if column not in raw.columns]
+        if missing_raw:
+            raise ValueError(f"Raw_Clean is missing columns: {missing_raw}")
+        labels = convert_raw_clean_labels(raw)
+    else:
+        raise ValueError(
+            f"{label_file} must contain a score column, or a Raw_Clean sheet with {RAW_LABEL_COLUMNS}."
+        )
+
+    if TARGET_COLUMN not in labels.columns and "avg" in labels.columns:
+        labels = labels.rename(columns={"avg": TARGET_COLUMN})
+
+    missing = [column for column in [TARGET_COLUMN] if column not in labels.columns]
+    if missing:
+        raise ValueError(f"Labeling.xlsx is missing columns: {missing}")
+
+    labels = labels.copy()
+    if "videoName" not in labels.columns and {"영상번호", "표정"}.issubset(labels.columns):
+        labels = convert_raw_clean_labels(labels)
+    if "userId" in labels.columns:
+        labels["userId"] = labels["userId"].map(normalize_text)
+    if "videoName" in labels.columns:
+        labels["videoName"] = labels["videoName"].map(normalize_text)
+        labels["_joinKey"] = labels["videoName"].map(join_key)
+    if "taskType" in labels.columns:
+        labels["taskType"] = labels["taskType"].map(normalize_text)
+    labels[TARGET_COLUMN] = pd.to_numeric(labels[TARGET_COLUMN], errors="coerce")
     return labels
+
+
+def convert_raw_clean_labels(raw: pd.DataFrame) -> pd.DataFrame:
+    score_column = TARGET_COLUMN if TARGET_COLUMN in raw.columns else "avg"
+    if score_column not in raw.columns:
+        raise ValueError(f"Raw labels must include either '{TARGET_COLUMN}' or 'avg'.")
+
+    rows: list[dict[str, Any]] = []
+    for _, row in raw.iterrows():
+        user_id = normalize_text(row["영상번호"])
+        expression_name = normalize_text(row["표정"]).replace(" ", "")
+        task_type = TASK_SUFFIXES.get(expression_name)
+        if not task_type:
+            raise ValueError(f"Unknown expression label in Raw_Clean: {expression_name}")
+
+        score_value = float(row[score_column])
+        rows.append(
+            {
+                "userId": user_id,
+                "videoName": f"{user_id}_{expression_name}.mp4",
+                "taskType": task_type,
+                TARGET_COLUMN: score_value,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def join_labels(summary: pd.DataFrame, labels: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
@@ -350,19 +538,15 @@ def join_labels(summary: pd.DataFrame, labels: pd.DataFrame, output_dir: Path) -
     labeled = labels.merge(summary_join, on="_joinKey", how="inner", suffixes=("", "_fromVideo"))
 
     if labeled.empty:
-        raise RuntimeError("No rows joined between summary dataset and Scaled_Label labels.")
+        raise RuntimeError("No rows joined between summary dataset and Labeling.xlsx labels.")
 
     labeled = labeled[
         [
             "userId",
             "videoName",
             "taskType",
+            TARGET_COLUMN,
             "sampleCount",
-            "taskPerformanceScore",
-            "negativeExpressionScore",
-            "finalNaturalnessScore",
-            "rigidityScore",
-            "reviewNeeded",
             *feature_columns,
         ]
     ].copy()
@@ -386,10 +570,32 @@ def join_labels(summary: pd.DataFrame, labels: pd.DataFrame, output_dir: Path) -
 
 def filtered_training_data(labeled: pd.DataFrame, exclude_review_needed: bool) -> pd.DataFrame:
     data = labeled.copy()
-    if exclude_review_needed:
+    if exclude_review_needed and "reviewNeeded" in data.columns:
         review = data["reviewNeeded"].astype(str).str.upper().str.strip()
         data = data[review.ne("YES")].copy()
-    return data.dropna(subset=["taskPerformanceScore", "negativeExpressionScore"]).reset_index(drop=True)
+    data[TARGET_COLUMN] = pd.to_numeric(data[TARGET_COLUMN], errors="coerce")
+    data = data.dropna(subset=[TARGET_COLUMN]).reset_index(drop=True)
+    return data
+
+
+def naturalness_binary_label(final_naturalness_score: float) -> str:
+    return "natural" if float(final_naturalness_score) >= 60 else "needs_improvement"
+
+
+def naturalness_level(final_naturalness_score: float) -> str:
+    score_value = float(final_naturalness_score)
+    if score_value < 40:
+        return "needs_improvement"
+    if score_value < 60:
+        return "slightly_awkward"
+    if score_value < 80:
+        return "mostly_natural"
+    return "very_natural"
+
+
+def is_boundary_ambiguous(final_naturalness_score: float) -> bool:
+    score_value = float(final_naturalness_score)
+    return any(lower <= score_value <= upper for lower, upper in BOUNDARY_AMBIGUOUS_RANGES)
 
 
 def task_one_hot_kwargs() -> dict[str, Any]:
@@ -401,17 +607,7 @@ def task_one_hot_kwargs() -> dict[str, Any]:
 
 
 def build_model_candidates(feature_columns: list[str], include_task_type: bool) -> dict[str, Pipeline]:
-    if include_task_type:
-        preprocessor = ColumnTransformer(
-            [
-                ("taskType", OneHotEncoder(**task_one_hot_kwargs()), ["taskType"]),
-                ("features", StandardScaler(), feature_columns),
-            ]
-        )
-        input_columns = ["taskType", *feature_columns]
-    else:
-        preprocessor = ColumnTransformer([("features", StandardScaler(), feature_columns)])
-        input_columns = feature_columns
+    preprocessor, input_columns = build_preprocessor(feature_columns, include_task_type)
 
     return {
         "Ridge": Pipeline(
@@ -451,6 +647,178 @@ def build_model_candidates(feature_columns: list[str], include_task_type: bool) 
     }, input_columns
 
 
+def build_classifier_candidates(feature_columns: list[str], include_task_type: bool) -> dict[str, Pipeline]:
+    preprocessor, input_columns = build_preprocessor(feature_columns, include_task_type)
+
+    return {
+        "LogisticRegression": Pipeline(
+            [
+                ("preprocess", preprocessor),
+                (
+                    "model",
+                    LogisticRegression(
+                        max_iter=2000,
+                        class_weight="balanced",
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
+        "RandomForestClassifier": Pipeline(
+            [
+                ("preprocess", preprocessor),
+                (
+                    "model",
+                    RandomForestClassifier(
+                        n_estimators=300,
+                        max_depth=None,
+                        min_samples_leaf=2,
+                        class_weight="balanced",
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
+        "GradientBoostingClassifier": Pipeline(
+            [
+                ("preprocess", preprocessor),
+                (
+                    "model",
+                    GradientBoostingClassifier(
+                        n_estimators=180,
+                        learning_rate=0.04,
+                        max_depth=2,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
+    }, input_columns
+
+
+def build_preprocessor(
+    feature_columns: list[str], include_task_type: bool
+) -> tuple[ColumnTransformer, list[str]]:
+    if include_task_type:
+        preprocessor = ColumnTransformer(
+            [
+                ("taskType", OneHotEncoder(**task_one_hot_kwargs()), ["taskType"]),
+                ("features", StandardScaler(), feature_columns),
+            ]
+        )
+        input_columns = ["taskType", *feature_columns]
+    else:
+        preprocessor = ColumnTransformer([("features", StandardScaler(), feature_columns)])
+        input_columns = feature_columns
+
+    return preprocessor, input_columns
+
+
+def infer_feature_columns(data: pd.DataFrame) -> list[str]:
+    feature_columns = [
+        column
+        for column in data.columns
+        if column not in NON_FEATURE_COLUMNS and not column.startswith("_")
+    ]
+    if not feature_columns:
+        raise RuntimeError("No feature columns found for score regression.")
+    return feature_columns
+
+
+def split_feature_columns(data: pd.DataFrame, feature_columns: list[str]) -> tuple[list[str], list[str]]:
+    numeric_columns: list[str] = []
+    categorical_columns: list[str] = []
+    for column in feature_columns:
+        if pd.api.types.is_numeric_dtype(data[column]):
+            numeric_columns.append(column)
+        else:
+            categorical_columns.append(column)
+    return numeric_columns, categorical_columns
+
+
+def build_score_preprocessor(
+    data: pd.DataFrame,
+    feature_columns: list[str],
+) -> tuple[ColumnTransformer, list[str], list[str]]:
+    numeric_columns, categorical_columns = split_feature_columns(data, feature_columns)
+    transformers: list[tuple[str, Pipeline, list[str]]] = []
+
+    if categorical_columns:
+        transformers.append(
+            (
+                "categorical",
+                Pipeline(
+                    [
+                        ("impute", SimpleImputer(strategy="most_frequent")),
+                        ("onehot", OneHotEncoder(**task_one_hot_kwargs())),
+                    ]
+                ),
+                categorical_columns,
+            )
+        )
+
+    if numeric_columns:
+        transformers.append(
+            (
+                "numeric",
+                Pipeline(
+                    [
+                        ("impute", SimpleImputer(strategy="median")),
+                        ("scale", StandardScaler()),
+                    ]
+                ),
+                numeric_columns,
+            )
+        )
+
+    if not transformers:
+        raise RuntimeError("No usable numeric or categorical feature columns found.")
+
+    return ColumnTransformer(transformers), numeric_columns, categorical_columns
+
+
+def build_score_model_candidates(data: pd.DataFrame, feature_columns: list[str]) -> dict[str, Pipeline]:
+    def preprocessor() -> ColumnTransformer:
+        return build_score_preprocessor(data, feature_columns)[0]
+
+    return {
+        "Ridge": Pipeline(
+            [
+                ("preprocess", preprocessor()),
+                ("model", Ridge(alpha=10.0)),
+            ]
+        ),
+        "RandomForestRegressor": Pipeline(
+            [
+                ("preprocess", preprocessor()),
+                (
+                    "model",
+                    RandomForestRegressor(
+                        n_estimators=300,
+                        max_depth=None,
+                        min_samples_leaf=2,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
+        "GradientBoostingRegressor": Pipeline(
+            [
+                ("preprocess", preprocessor()),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=180,
+                        learning_rate=0.04,
+                        max_depth=2,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
+    }
+
+
 def rmse(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2)))
 
@@ -470,22 +838,21 @@ def evaluate_candidates(
     target_column: str,
     feature_columns: list[str],
     include_task_type: bool,
-) -> tuple[str, Pipeline, dict[str, Any], list[str]]:
-    candidates, input_columns = build_model_candidates(feature_columns, include_task_type)
-    groups = data["userId"].astype(str)
-    unique_groups = groups.nunique()
-    if unique_groups < 2:
-        raise RuntimeError("GroupKFold requires at least two distinct userId groups.")
+) -> tuple[str, Pipeline, dict[str, Any], list[str], list[str], list[str]]:
+    del include_task_type
+    candidates = build_score_model_candidates(data, feature_columns)
+    n_splits = min(5, len(data))
+    if n_splits < 2:
+        raise RuntimeError(f"At least two training rows are required for cross validation: {len(data)}")
 
-    n_splits = min(5, unique_groups)
-    splitter = GroupKFold(n_splits=n_splits)
-    X = data[input_columns]
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    X = data[feature_columns]
     y = data[target_column].astype(float)
     metrics: dict[str, Any] = {}
 
     for name, model in candidates.items():
         fold_metrics = []
-        for fold_index, (train_idx, test_idx) in enumerate(splitter.split(X, y, groups), start=1):
+        for fold_index, (train_idx, test_idx) in enumerate(splitter.split(X, y), start=1):
             model.fit(X.iloc[train_idx], y.iloc[train_idx])
             predictions = np.clip(model.predict(X.iloc[test_idx]), 0, 100)
             fold_metrics.append(
@@ -504,80 +871,263 @@ def evaluate_candidates(
             "folds": fold_metrics,
             "mean_mae": float(np.nanmean(mae_values)),
             "mean_rmse": float(np.nanmean(rmse_values)),
-            "std_rmse": float(np.nanstd(rmse_values)),
             "mean_r2": float(np.nanmean(r2_values)),
-            "selection_score": float(np.nanmean(rmse_values) + np.nanstd(rmse_values)),
         }
 
-    best_name = min(metrics, key=lambda name: metrics[name]["selection_score"])
+    best_name = max(metrics, key=lambda name: metrics[name]["mean_r2"])
+    best_model = candidates[best_name]
+    best_model.fit(X, y)
+    _, numeric_columns, categorical_columns = build_score_preprocessor(data, feature_columns)
+    return best_name, best_model, metrics, feature_columns, numeric_columns, categorical_columns
+
+
+def evaluate_classifier_candidates(
+    data: pd.DataFrame,
+    target_column: str,
+    feature_columns: list[str],
+    include_task_type: bool,
+    labels: list[Any],
+    average_mode: str,
+    positive_label: Any | None = None,
+) -> tuple[str, Pipeline, dict[str, Any], list[str]]:
+    if len(data) < 4:
+        raise RuntimeError(f"Not enough classifier rows for {target_column}: {len(data)}")
+
+    candidates, input_columns = build_classifier_candidates(feature_columns, include_task_type)
+    groups = data["userId"].astype(str)
+    unique_groups = groups.nunique()
+    if unique_groups < 2:
+        raise RuntimeError("GroupKFold requires at least two distinct userId groups.")
+
+    if data[target_column].nunique() < 2:
+        raise RuntimeError(f"{target_column} requires at least two classes.")
+
+    n_splits = min(5, unique_groups)
+    splitter = GroupKFold(n_splits=n_splits)
+    X = data[input_columns]
+    y = data[target_column]
+    metrics: dict[str, Any] = {}
+
+    for name, model in candidates.items():
+        fold_metrics = []
+        all_true = []
+        all_pred = []
+        for fold_index, (train_idx, test_idx) in enumerate(splitter.split(X, y, groups), start=1):
+            model.fit(X.iloc[train_idx], y.iloc[train_idx])
+            predictions = model.predict(X.iloc[test_idx])
+            truth = y.iloc[test_idx]
+            all_true.extend(truth.tolist())
+            all_pred.extend(predictions.tolist())
+            fold_metrics.append(
+                classifier_metric_row(
+                    fold_index=fold_index,
+                    y_true=truth,
+                    y_pred=predictions,
+                    labels=labels,
+                    average_mode=average_mode,
+                    positive_label=positive_label,
+                )
+            )
+
+        aggregate = classifier_metric_row(
+            fold_index=None,
+            y_true=pd.Series(all_true),
+            y_pred=np.array(all_pred),
+            labels=labels,
+            average_mode=average_mode,
+            positive_label=positive_label,
+        )
+        selection_metric = aggregate["macro_f1"] if average_mode == "macro" else aggregate["f1"]
+        metrics[name] = {
+            "folds": fold_metrics,
+            **{key: value for key, value in aggregate.items() if key != "fold"},
+            "selectionMetric": "macro_f1" if average_mode == "macro" else "f1",
+            "selection_score": float(1.0 - selection_metric),
+        }
+
+    best_name = select_best_classifier(metrics, "macro_f1" if average_mode == "macro" else "f1")
     best_model = candidates[best_name]
     best_model.fit(X, y)
     return best_name, best_model, metrics, input_columns
+
+
+def select_best_classifier(metrics: dict[str, Any], metric_key: str, tolerance: float = 0.01) -> str:
+    best_metric = max(float(row[metric_key]) for row in metrics.values())
+    candidates = [
+        name
+        for name, row in metrics.items()
+        if float(row[metric_key]) >= best_metric - tolerance
+    ]
+    return max(candidates, key=lambda name: (float(metrics[name]["accuracy"]), float(metrics[name][metric_key])))
+
+
+def classifier_metric_row(
+    fold_index: int | None,
+    y_true: pd.Series | np.ndarray,
+    y_pred: pd.Series | np.ndarray,
+    labels: list[Any],
+    average_mode: str,
+    positive_label: Any | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
+        "labels": labels,
+    }
+    if fold_index is not None:
+        row["fold"] = fold_index
+
+    if average_mode == "macro":
+        row["macro_precision"] = float(
+            precision_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        )
+        row["macro_recall"] = float(
+            recall_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        )
+        row["macro_f1"] = float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0))
+    else:
+        kwargs = {"zero_division": 0}
+        if positive_label is not None:
+            kwargs["pos_label"] = positive_label
+            row["positiveLabel"] = positive_label
+        row["precision"] = float(precision_score(y_true, y_pred, **kwargs))
+        row["recall"] = float(recall_score(y_true, y_pred, **kwargs))
+        row["f1"] = float(f1_score(y_true, y_pred, **kwargs))
+
+    return row
+
+
+def train_naturalness_level_experiment(
+    data: pd.DataFrame,
+    feature_columns: list[str],
+    experiment_name: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "experimentName": experiment_name,
+        "trained": False,
+        "trainingRows": int(len(data)),
+        "classDistribution": class_distribution(data, "naturalnessLevel", NATURALNESS_LEVEL_LABELS),
+    }
+    if len(data) < 4:
+        result["warning"] = f"Skipped: not enough rows after filtering ({len(data)})."
+        return result
+    if data["userId"].astype(str).nunique() < 2:
+        result["warning"] = "Skipped: fewer than two userId groups after filtering."
+        return result
+    if data["naturalnessLevel"].nunique() < 2:
+        result["warning"] = "Skipped: fewer than two naturalnessLevel classes after filtering."
+        return result
+
+    name, model, metrics, input_columns = evaluate_classifier_candidates(
+        data=data,
+        target_column="naturalnessLevel",
+        feature_columns=feature_columns,
+        include_task_type=True,
+        labels=NATURALNESS_LEVEL_LABELS,
+        average_mode="macro",
+    )
+    result.update(
+        {
+            "trained": True,
+            "selectedModel": name,
+            "model": model,
+            "metrics": metrics,
+            "inputColumns": input_columns,
+            "selectedMetrics": metrics[name],
+        }
+    )
+    return result
+
+
+def experiment_report(experiment: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "experimentName",
+        "trained",
+        "trainingRows",
+        "classDistribution",
+        "selectedModel",
+        "metrics",
+        "selectedMetrics",
+        "warning",
+    ]
+    return {key: experiment[key] for key in keys if key in experiment}
+
+
+def class_distribution(data: pd.DataFrame, column: str, labels: list[Any]) -> dict[str, int]:
+    values = data[column].value_counts().reindex(labels, fill_value=0)
+    return {str(key): int(value) for key, value in values.to_dict().items()}
+
+
+def naturalness_level_rules() -> dict[str, str]:
+    return {
+        "needs_improvement": "0 <= finalNaturalnessScore < 40",
+        "slightly_awkward": "40 <= finalNaturalnessScore < 60",
+        "mostly_natural": "60 <= finalNaturalnessScore < 80",
+        "very_natural": "80 <= finalNaturalnessScore <= 100",
+    }
+
+
+def boundary_ambiguous_rules() -> list[str]:
+    return [
+        "38 <= finalNaturalnessScore <= 42",
+        "58 <= finalNaturalnessScore <= 62",
+        "78 <= finalNaturalnessScore <= 82",
+    ]
 
 
 def train_and_save_models(
     labeled: pd.DataFrame,
     output_dir: Path,
     exclude_review_needed: bool,
+    exclude_boundary_ambiguous: bool = False,
 ) -> dict[str, Any]:
+    del exclude_boundary_ambiguous
     data = filtered_training_data(labeled, exclude_review_needed)
-    feature_columns = [column for column in data.columns if column.startswith(("mean_", "std_"))]
-    data = data.dropna(subset=feature_columns).reset_index(drop=True)
+    feature_columns = infer_feature_columns(data)
     if len(data) < 4:
         raise RuntimeError(f"Not enough training rows after filtering: {len(data)}")
+    data.to_csv(output_dir / "faceease_labeled_dataset.csv", index=False, encoding="utf-8-sig")
 
-    task_name, task_model, task_metrics, task_input_columns = evaluate_candidates(
+    model_name, model, metrics, input_columns, numeric_columns, categorical_columns = evaluate_candidates(
         data=data,
-        target_column="taskPerformanceScore",
-        feature_columns=feature_columns,
-        include_task_type=True,
-    )
-    negative_name, negative_model, negative_metrics, negative_input_columns = evaluate_candidates(
-        data=data,
-        target_column="negativeExpressionScore",
+        target_column=TARGET_COLUMN,
         feature_columns=feature_columns,
         include_task_type=False,
     )
 
-    task_artifact = {
-        "model": task_model,
-        "modelName": task_name,
-        "target": "taskPerformanceScore",
+    artifact = {
+        "model": model,
+        "modelName": model_name,
+        "target": TARGET_COLUMN,
+        "scoreDefinition": SCORE_DEFINITION,
+        "negativePatternDefinition": NEGATIVE_PATTERN_DEFINITION,
         "featureColumns": feature_columns,
-        "inputColumns": task_input_columns,
-        "includeTaskType": True,
+        "inputColumns": input_columns,
+        "numericFeatureColumns": numeric_columns,
+        "categoricalFeatureColumns": categorical_columns,
+        "includeTaskType": "taskType" in categorical_columns,
         "excludeReviewNeeded": exclude_review_needed,
-        "metrics": task_metrics,
+        "featureAdjustment": {
+            "calmBaselineTaskType": CALM_BASELINE_TASK_TYPE,
+            "calmBaselineScale": CALM_BASELINE_SCALE,
+            "calmBaselineFeatureKeys": list(CALM_BASELINE_FEATURE_KEYS),
+        },
+        "metrics": metrics,
+        "selectedMetrics": metrics[model_name],
         "positiveTasks": sorted(POSITIVE_TASKS),
         "negativeTasks": sorted(NEGATIVE_TASKS),
     }
-    negative_artifact = {
-        "model": negative_model,
-        "modelName": negative_name,
-        "target": "negativeExpressionScore",
-        "featureColumns": feature_columns,
-        "inputColumns": negative_input_columns,
-        "includeTaskType": False,
-        "excludeReviewNeeded": exclude_review_needed,
-        "metrics": negative_metrics,
-        "positiveTasks": sorted(POSITIVE_TASKS),
-        "negativeTasks": sorted(NEGATIVE_TASKS),
-    }
-
-    joblib.dump(task_artifact, output_dir / "faceease_task_model.pkl")
-    joblib.dump(negative_artifact, output_dir / "faceease_negative_model.pkl")
+    joblib.dump(artifact, output_dir / "faceease_score_model.pkl")
 
     report = {
         "trainingRows": int(len(data)),
-        "excludedReviewNeeded": bool(exclude_review_needed),
-        "taskPerformanceModel": {
-            "selectedModel": task_name,
-            "metrics": task_metrics,
-        },
-        "negativeExpressionModel": {
-            "selectedModel": negative_name,
-            "metrics": negative_metrics,
-        },
+        "target": TARGET_COLUMN,
+        "scoreDefinition": SCORE_DEFINITION,
+        "negativePatternDefinition": NEGATIVE_PATTERN_DEFINITION,
+        "selectedModel": model_name,
+        "selectedMetrics": metrics[model_name],
+        "metrics": metrics,
+        "presentationSummary": PRESENTATION_SUMMARY,
     }
     (output_dir / "faceease_training_report.json").write_text(
         json.dumps(json_safe(report), ensure_ascii=False, indent=2),
@@ -587,7 +1137,7 @@ def train_and_save_models(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and train the FaceEase video-level regression dataset.")
+    parser = argparse.ArgumentParser(description="Train the FaceEase score regression model.")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--label-file", type=Path, default=DEFAULT_LABEL_FILE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -598,20 +1148,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include rows where reviewNeeded is YES. By default they are excluded from training.",
     )
+    parser.add_argument(
+        "--exclude-boundary-ambiguous",
+        action="store_true",
+        help="Deprecated. Kept for CLI compatibility; score regression does not use boundary relabeling.",
+    )
     return parser.parse_args()
+
+
+def has_feature_columns(labels: pd.DataFrame) -> bool:
+    candidates = [column for column in labels.columns if column not in NON_FEATURE_COLUMNS]
+    if any(column != "taskType" for column in candidates):
+        return True
+    return bool(candidates and "videoName" not in labels.columns)
 
 
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = ensure_model_file(args.output_dir, args.model_path)
-    summary = build_summary_dataset(args.data_dir, args.output_dir, model_path, args.interval_seconds)
     labels = load_labels(args.label_file)
-    labeled = join_labels(summary, labels, args.output_dir)
+    if has_feature_columns(labels):
+        labeled = labels.copy()
+        labeled.to_csv(args.output_dir / "faceease_labeled_dataset.csv", index=False, encoding="utf-8-sig")
+    else:
+        if "_joinKey" not in labels.columns:
+            raise RuntimeError("Labeling.xlsx has no feature columns and no videoName/join key for video feature extraction.")
+        model_path = ensure_model_file(args.output_dir, args.model_path)
+        summary = build_summary_dataset(args.data_dir, args.output_dir, model_path, args.interval_seconds)
+        labeled = join_labels(summary, labels, args.output_dir)
     report = train_and_save_models(
         labeled=labeled,
         output_dir=args.output_dir,
         exclude_review_needed=not args.include_review_needed,
+        exclude_boundary_ambiguous=args.exclude_boundary_ambiguous,
     )
     print(json.dumps(json_safe(report), ensure_ascii=False, indent=2))
 
