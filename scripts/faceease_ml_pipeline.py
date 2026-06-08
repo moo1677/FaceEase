@@ -1075,6 +1075,65 @@ def boundary_ambiguous_rules() -> list[str]:
     ]
 
 
+def train_negative_pattern_classifier(
+    data: pd.DataFrame,
+    feature_columns: list[str],
+    output_dir: Path,
+) -> dict[str, Any]:
+    numeric_feature_columns = [
+        col for col in feature_columns
+        if col != "taskType" and pd.api.types.is_numeric_dtype(data[col])
+    ]
+
+    work = data.copy()
+    work["negative_pattern"] = work["taskType"].apply(
+        lambda t: 1 if t in NEGATIVE_TASKS else 0
+    )
+
+    result: dict[str, Any] = {
+        "trained": False,
+        "trainingRows": int(len(work)),
+        "classDistribution": class_distribution(work, "negative_pattern", NEGATIVE_PATTERN_LABELS),
+    }
+
+    if work["negative_pattern"].nunique() < 2:
+        result["warning"] = "Skipped: no negative task examples in dataset."
+        return result
+    if work["userId"].astype(str).nunique() < 2:
+        result["warning"] = "Skipped: fewer than two userId groups."
+        return result
+
+    name, model, metrics, input_columns = evaluate_classifier_candidates(
+        data=work,
+        target_column="negative_pattern",
+        feature_columns=numeric_feature_columns,
+        include_task_type=False,
+        labels=NEGATIVE_PATTERN_LABELS,
+        average_mode="binary",
+        positive_label=1,
+    )
+
+    artifact = {
+        "model": model,
+        "modelName": name,
+        "target": "negative_pattern",
+        "classes": NEGATIVE_PATTERN_LABELS,
+        "featureColumns": numeric_feature_columns,
+        "inputColumns": input_columns,
+        "metrics": metrics,
+        "selectedMetrics": metrics[name],
+        "negativeTasks": sorted(NEGATIVE_TASKS),
+    }
+    joblib.dump(artifact, output_dir / "faceease_negative_pattern_model.pkl")
+
+    result.update({
+        "trained": True,
+        "selectedModel": name,
+        "selectedMetrics": metrics[name],
+    })
+    return result
+
+
 def train_and_save_models(
     labeled: pd.DataFrame,
     output_dir: Path,
@@ -1082,14 +1141,20 @@ def train_and_save_models(
     exclude_boundary_ambiguous: bool = False,
 ) -> dict[str, Any]:
     del exclude_boundary_ambiguous
-    data = filtered_training_data(labeled, exclude_review_needed)
-    feature_columns = infer_feature_columns(data)
-    if len(data) < 4:
-        raise RuntimeError(f"Not enough training rows after filtering: {len(data)}")
-    data.to_csv(output_dir / "faceease_labeled_dataset.csv", index=False, encoding="utf-8-sig")
+
+    all_data = filtered_training_data(labeled, exclude_review_needed)
+    feature_columns = infer_feature_columns(all_data)
+    if len(all_data) < 4:
+        raise RuntimeError(f"Not enough training rows after filtering: {len(all_data)}")
+
+    # score model: 긍정 과제(자연미소, 경청, 차분)만으로 학습
+    positive_data = all_data[all_data["taskType"].isin(POSITIVE_TASKS)].copy()
+    if len(positive_data) < 4:
+        raise RuntimeError(f"Not enough positive task rows for score model: {len(positive_data)}")
+    positive_data.to_csv(output_dir / "faceease_labeled_dataset.csv", index=False, encoding="utf-8-sig")
 
     model_name, model, metrics, input_columns, numeric_columns, categorical_columns = evaluate_candidates(
-        data=data,
+        data=positive_data,
         target_column=TARGET_COLUMN,
         feature_columns=feature_columns,
         include_task_type=False,
@@ -1119,14 +1184,19 @@ def train_and_save_models(
     }
     joblib.dump(artifact, output_dir / "faceease_score_model.pkl")
 
+    # negative pattern model: 전체 데이터로 이진 분류 학습
+    negative_report = train_negative_pattern_classifier(all_data, feature_columns, output_dir)
+
     report = {
-        "trainingRows": int(len(data)),
+        "scoreModelTrainingRows": int(len(positive_data)),
+        "allTrainingRows": int(len(all_data)),
         "target": TARGET_COLUMN,
         "scoreDefinition": SCORE_DEFINITION,
         "negativePatternDefinition": NEGATIVE_PATTERN_DEFINITION,
         "selectedModel": model_name,
         "selectedMetrics": metrics[model_name],
         "metrics": metrics,
+        "negativePatternModel": negative_report,
         "presentationSummary": PRESENTATION_SUMMARY,
     }
     (output_dir / "faceease_training_report.json").write_text(

@@ -1,18 +1,20 @@
 import {
   DrawingUtils,
   FaceLandmarker,
-  FilesetResolver
+  FilesetResolver,
 } from "@mediapipe/tasks-vision";
 import "./styles.css";
 
-const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+const WASM_PATH =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
 const MODEL_PATH =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
 const BROWSER_MODEL_PATH = "/models/faceease_models.json";
 const ANALYSIS_DURATION_MS = 5000;
 const CALM_BASELINE_SCALE = 0.8;
 const CALM_BASELINE_SAMPLE_LIMIT = 90;
-const CALM_BASELINE_MIN_SAMPLES = 15;
+const CALM_BASELINE_MIN_SAMPLES = 30;
+const CALM_BASELINE_DURATION_MS = 3000;
 const NEUTRAL_BASELINE_TASK_TYPE = "neutral_baseline";
 const CALM_BASELINE_KEYS = [
   "smile",
@@ -21,7 +23,7 @@ const CALM_BASELINE_KEYS = [
   "mouthTension",
   "blink",
   "asymmetry",
-  "browDown"
+  "browDown",
 ];
 
 const video = document.querySelector("#camera");
@@ -46,8 +48,10 @@ const scoreElements = {
   naturalness: document.querySelector("#naturalnessScore"),
   task: document.querySelector("#taskScore"),
   negative: document.querySelector("#negativeScore"),
-  negativePatternProbability: document.querySelector("#negativePatternProbability"),
-  serviceSampleCount: document.querySelector("#serviceSampleCount")
+  negativePatternProbability: document.querySelector(
+    "#negativePatternProbability",
+  ),
+  serviceSampleCount: document.querySelector("#serviceSampleCount"),
 };
 
 export const FEATURE_KEYS = [
@@ -59,19 +63,19 @@ export const FEATURE_KEYS = [
   "blink",
   "smile",
   "jawOpen",
-  "browActivity"
+  "browActivity",
 ];
 export const SUMMARY_FEATURE_KEYS = [
   ...FEATURE_KEYS,
   "baselineNaturalness",
-  "baselineRigidity"
+  "baselineRigidity",
 ];
 export const POSITIVE_TASK_TYPES = ["natural_smile", "listening", "calm"];
 export const GRADE_LABELS = {
   very_natural: "매우 자연스러움",
   mostly_natural: "대체로 자연스러움",
   slightly_awkward: "다소 어색함",
-  needs_improvement: "개선 필요"
+  needs_improvement: "개선 필요",
 };
 export const FEEDBACK_THRESHOLDS = {
   natural_smile: {
@@ -79,29 +83,29 @@ export const FEEDBACK_THRESHOLDS = {
     lowEyeBlinkMax: 0.08,
     lowEyeBrowMax: 0.045,
     asymmetryHigh: 0.07,
-    mouthTensionHigh: 0.25
+    mouthTensionHigh: 0.25,
   },
   listening: {
     overSmileHigh: 0.12,
     mouthTensionHigh: 0.11,
     lowBlinkMax: 0.06,
     restlessExpressionStdHigh: 0.04,
-    jawOpenHigh: 0.07
+    jawOpenHigh: 0.07,
   },
   calm: {
     mouthTensionHigh: 0.13,
     browActivityHigh: 0.22,
     asymmetryHigh: 0.05,
     expressionActivityHigh: 0.13,
-    frameMotionStdHigh: 0.03
-  }
+    frameMotionStdHigh: 0.03,
+  },
 };
 const SAMPLE_INTERVAL_MS = 500;
 const TASK_PROMPTS = {
   neutral_baseline: "무표정으로 얼굴 기준값을 잡아주세요",
   natural_smile: "자연스러운 미소를 지어보세요",
   listening: "경청하는 표정을 지어보세요",
-  calm: "차분한 표정을 지어보세요"
+  calm: "차분한 표정을 지어보세요",
 };
 
 const ui = {
@@ -111,7 +115,7 @@ const ui = {
   motion: document.querySelector("#motionValue"),
   asymmetry: document.querySelector("#asymmetryValue"),
   mouthTension: document.querySelector("#mouthTensionValue"),
-  blink: document.querySelector("#blinkValue")
+  blink: document.querySelector("#blinkValue"),
 };
 
 let faceLandmarker;
@@ -129,6 +133,7 @@ let isAnalyzing = false;
 let analysisStartTime = 0;
 let lastAnalysisSampleTime = 0;
 let calmBaseline = null;
+let calmBaselineStartTime = 0;
 let isCollectingNeutralBaseline = false;
 const motionWindow = [];
 const calmBaselineSamples = [];
@@ -139,12 +144,14 @@ startButton.disabled = true;
 startButton.addEventListener("click", startCamera);
 analyzeButton.addEventListener("click", startServiceAnalysis);
 taskButtons.forEach((button) => {
-  button.addEventListener("click", () => selectTaskType(button.dataset.taskType));
+  button.addEventListener("click", () =>
+    selectTaskType(button.dataset.taskType),
+  );
 });
-snapshotButton.addEventListener("click", collectSample);
-recordButton.addEventListener("click", toggleRecording);
-downloadButton.addEventListener("click", downloadCsv);
-clearButton.addEventListener("click", clearDataset);
+snapshotButton?.addEventListener("click", collectSample);
+recordButton?.addEventListener("click", toggleRecording);
+downloadButton?.addEventListener("click", downloadCsv);
+clearButton?.addEventListener("click", clearDataset);
 
 updateTaskNavigation();
 initFaceLandmarker();
@@ -156,14 +163,14 @@ async function initFaceLandmarker() {
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
       baseOptions: {
         modelAssetPath: MODEL_PATH,
-        delegate: "GPU"
+        delegate: "GPU",
       },
       runningMode: "VIDEO",
       numFaces: 1,
       outputFaceBlendshapes: true,
       minFaceDetectionConfidence: 0.5,
       minFacePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5
+      minTrackingConfidence: 0.5,
     });
 
     drawingUtils = new DrawingUtils(context);
@@ -191,7 +198,8 @@ async function loadBrowserModels() {
     updateServiceControls();
   } catch (error) {
     console.error("브라우저 분석 모델 로딩 실패:", error);
-    statusElement.textContent = "분석 모델 로딩 실패. npm run ml:export를 실행했는지 확인하세요.";
+    statusElement.textContent =
+      "분석 모델 로딩 실패. npm run ml:export를 실행했는지 확인하세요.";
   }
 }
 
@@ -205,9 +213,9 @@ async function startCamera() {
       video: {
         width: { ideal: 1280 },
         height: { ideal: 720 },
-        facingMode: "user"
+        facingMode: "user",
       },
-      audio: false
+      audio: false,
     });
 
     video.srcObject = stream;
@@ -216,7 +224,8 @@ async function startCamera() {
 
     isRunning = true;
     startButton.disabled = true;
-    statusElement.textContent = "무표정 버튼을 눌러 얼굴 기준값 수집을 시작하세요.";
+    statusElement.textContent =
+      "무표정 버튼을 눌러 얼굴 기준값 수집을 시작하세요.";
     updateServiceControls();
     requestAnimationFrame(renderLoop);
     return true;
@@ -232,7 +241,10 @@ function renderLoop() {
     return;
   }
 
-  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.currentTime !== lastVideoTime) {
+  if (
+    video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+    video.currentTime !== lastVideoTime
+  ) {
     lastVideoTime = video.currentTime;
     resizeCanvasToVideo();
 
@@ -248,7 +260,11 @@ function resizeCanvasToVideo() {
   const width = video.videoWidth;
   const height = video.videoHeight;
 
-  if (!width || !height || (canvas.width === width && canvas.height === height)) {
+  if (
+    !width ||
+    !height ||
+    (canvas.width === width && canvas.height === height)
+  ) {
     return;
   }
 
@@ -268,24 +284,37 @@ function drawResult(result) {
   }
 
   if (!isAnalyzing && selectedTaskType !== NEUTRAL_BASELINE_TASK_TYPE) {
-    statusElement.textContent = "얼굴 인식 중입니다. 5초 분석을 시작할 수 있습니다.";
+    statusElement.textContent =
+      "얼굴 인식 중입니다. 5초 분석을 시작할 수 있습니다.";
   }
-  drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, {
-    color: "#24d18b",
-    lineWidth: 2
-  });
+  drawingUtils.drawConnectors(
+    landmarks,
+    FaceLandmarker.FACE_LANDMARKS_FACE_OVAL,
+    {
+      color: "#24d18b",
+      lineWidth: 2,
+    },
+  );
   drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LIPS, {
     color: "#ff7a59",
-    lineWidth: 2
+    lineWidth: 2,
   });
-  drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, {
-    color: "#5aa9ff",
-    lineWidth: 1.5
-  });
-  drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, {
-    color: "#5aa9ff",
-    lineWidth: 1.5
-  });
+  drawingUtils.drawConnectors(
+    landmarks,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_EYE,
+    {
+      color: "#5aa9ff",
+      lineWidth: 1.5,
+    },
+  );
+  drawingUtils.drawConnectors(
+    landmarks,
+    FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
+    {
+      color: "#5aa9ff",
+      lineWidth: 1.5,
+    },
+  );
 }
 
 function processResult(result) {
@@ -296,7 +325,7 @@ function processResult(result) {
   }
 
   const blendshapes = Object.fromEntries(
-    categories.map((category) => [category.categoryName, category.score])
+    categories.map((category) => [category.categoryName, category.score]),
   );
 
   if (isCollectingNeutralBaseline && !isAnalyzing) {
@@ -304,7 +333,7 @@ function processResult(result) {
   }
 
   const variables = calculateExpressionVariables(blendshapes, {
-    calmBaseline: hasCalmBaseline() ? calmBaseline : null
+    calmBaseline: hasCalmBaseline() ? calmBaseline : null,
   });
   latestVariables = variables;
 
@@ -325,7 +354,7 @@ function processResult(result) {
       blink: variables.blink,
       smile: variables.smile,
       jawOpen: variables.jawOpen,
-      browActivity: variables.browActivity
+      browActivity: variables.browActivity,
     });
   }
 
@@ -347,7 +376,8 @@ function selectTaskType(taskType) {
   if (taskType !== NEUTRAL_BASELINE_TASK_TYPE && !hasCalmBaseline()) {
     selectedTaskType = NEUTRAL_BASELINE_TASK_TYPE;
     taskPromptElement.textContent = TASK_PROMPTS[NEUTRAL_BASELINE_TASK_TYPE];
-    statusElement.textContent = "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡아주세요.";
+    statusElement.textContent =
+      "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡아주세요.";
     updateTaskNavigation();
     resetServiceResult();
     return;
@@ -368,6 +398,7 @@ function startNeutralBaselineCollection() {
   selectedTaskType = NEUTRAL_BASELINE_TASK_TYPE;
   taskPromptElement.textContent = TASK_PROMPTS[NEUTRAL_BASELINE_TASK_TYPE];
   calmBaseline = null;
+  calmBaselineStartTime = performance.now();
   calmBaselineSamples.length = 0;
   isCollectingNeutralBaseline = true;
   resetExpressionState();
@@ -390,7 +421,8 @@ async function startServiceAnalysis() {
   }
 
   if (!hasCalmBaseline()) {
-    statusElement.textContent = "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡은 뒤 분석하세요.";
+    statusElement.textContent =
+      "먼저 무표정 버튼을 눌러 얼굴 기준값을 잡은 뒤 분석하세요.";
     return;
   }
 
@@ -407,7 +439,7 @@ async function startServiceAnalysis() {
   progressElement.style.width = "0%";
   scoreElements.serviceSampleCount.textContent = "0";
   feedbackList.innerHTML = "<li>분석 중입니다.</li>";
-  setScoreText("--", "--", "--", "--", "--");
+  setScoreText("--", "--", "--", "--");
   updateServiceControls();
 }
 
@@ -434,41 +466,52 @@ function finishServiceAnalysis() {
   updateServiceControls();
 
   if (!analysisRows.length) {
-    statusElement.textContent = "분석할 수 있는 얼굴 feature가 충분하지 않습니다.";
-    feedbackList.innerHTML = "<li>얼굴이 화면 중앙에 보이도록 맞춘 뒤 다시 시도하세요.</li>";
+    statusElement.textContent =
+      "분석할 수 있는 얼굴 feature가 충분하지 않습니다.";
+    feedbackList.innerHTML =
+      "<li>얼굴이 화면 중앙에 보이도록 맞춘 뒤 다시 시도하세요.</li>";
     progressElement.style.width = "0%";
     return;
   }
 
   const summaryFeatures = summarizeFrameVariables(analysisRows);
-  const predictedScore = predictModel(browserModels.scoreModel, {
+  const taskScore = predictModel(browserModels.scoreModel, {
     taskType: selectedTaskType,
-    summaryFeatures
+    summaryFeatures,
   });
-  const naturalnessGrade = gradeFromScore(predictedScore);
+  const negativePatternScore = calculateNegativePatternScore(summaryFeatures);
+  const finalScore = Math.round(
+    clampScore(taskScore * 0.6 + negativePatternScore * 0.4),
+  );
+  const naturalnessGrade = gradeFromScore(finalScore);
   const feedback = generateTaskFeedback({
     taskType: selectedTaskType,
-    predictedScore,
+    predictedScore: finalScore,
+    taskScore,
+    negativePatternScore,
     naturalnessGrade,
-    summaryFeatures
+    summaryFeatures,
   });
 
   setScoreText(
     formatGrade(naturalnessGrade),
-    formatScore(predictedScore),
-    "score",
-    selectedTaskType === "awkward" || selectedTaskType === "over_smile" ? "부정 계열" : "일반 계열",
-    browserModels.scoreModel.modelName
+    formatScore(finalScore),
+    formatScore(taskScore),
+    formatScore(negativePatternScore),
   );
-  feedbackList.innerHTML = feedback.map((message) => `<li>${escapeHtml(message)}</li>`).join("");
+  feedbackList.innerHTML = feedback
+    .map((message) => `<li>${escapeHtml(message)}</li>`)
+    .join("");
   statusElement.textContent = "분석 완료";
   progressElement.style.width = "100%";
   console.log("faceease_service_result", {
     taskType: selectedTaskType,
-    predictedScore,
+    taskScore,
+    negativePatternScore,
+    finalScore,
     naturalnessGrade,
     summaryFeatures,
-    feedback
+    feedback,
   });
 }
 
@@ -485,18 +528,21 @@ function updateServiceControls() {
 }
 
 function resetServiceResult() {
-  setScoreText("--", "--", "--", "--", "--");
+  setScoreText("--", "--", "--", "--");
   scoreElements.serviceSampleCount.textContent = "0";
   feedbackList.innerHTML = "<li>분석 결과가 여기에 표시됩니다.</li>";
   progressElement.style.width = "0%";
 }
 
-function setScoreText(grade, naturalness, task, negative, negativePatternProbability) {
+function setScoreText(grade, naturalness, task, negative) {
   scoreElements.grade.textContent = grade;
   scoreElements.naturalness.textContent = naturalness;
-  scoreElements.task.textContent = task;
-  scoreElements.negative.textContent = negative;
-  scoreElements.negativePatternProbability.textContent = negativePatternProbability;
+  if (scoreElements.task) {
+    scoreElements.task.textContent = task;
+  }
+  if (scoreElements.negative) {
+    scoreElements.negative.textContent = negative;
+  }
 }
 
 function predictModel(model, { taskType, summaryFeatures }) {
@@ -504,15 +550,18 @@ function predictModel(model, { taskType, summaryFeatures }) {
   let prediction = 0;
 
   if (model.kind === "linear") {
-    prediction = model.intercept + model.coef.reduce((sum, coefficient, index) => {
-      return sum + coefficient * input[index];
-    }, 0);
+    prediction =
+      model.intercept +
+      model.coef.reduce((sum, coefficient, index) => {
+        return sum + coefficient * input[index];
+      }, 0);
   } else if (model.kind === "randomForest") {
     prediction = average(model.trees.map((tree) => predictTree(tree, input)));
   } else if (model.kind === "gradientBoosting") {
     prediction =
       model.initialPrediction +
-      model.learningRate * model.trees.reduce((sum, tree) => sum + predictTree(tree, input), 0);
+      model.learningRate *
+        model.trees.reduce((sum, tree) => sum + predictTree(tree, input), 0);
   }
 
   return clampScore(prediction);
@@ -526,10 +575,15 @@ function predictClassifierProbabilities(model, { taskType, summaryFeatures }) {
   }
 
   if (model.kind === "randomForestClassifier") {
-    const summed = model.trees.reduce((totals, tree) => {
-      const probabilities = normalizeProbabilities(predictTree(tree, input));
-      return totals.map((total, index) => total + (probabilities[index] ?? 0));
-    }, model.classes.map(() => 0));
+    const summed = model.trees.reduce(
+      (totals, tree) => {
+        const probabilities = normalizeProbabilities(predictTree(tree, input));
+        return totals.map(
+          (total, index) => total + (probabilities[index] ?? 0),
+        );
+      },
+      model.classes.map(() => 0),
+    );
     return probabilitiesByClass(model.classes, normalizeProbabilities(summed));
   }
 
@@ -542,27 +596,40 @@ function predictClassifierProbabilities(model, { taskType, summaryFeatures }) {
 
 function logisticProbabilities(model, input) {
   if (model.classes.length === 2 && model.coef.length === 1) {
-    const raw = model.intercept[0] + model.coef[0].reduce((sum, coefficient, index) => {
-      return sum + coefficient * input[index];
-    }, 0);
+    const raw =
+      model.intercept[0] +
+      model.coef[0].reduce((sum, coefficient, index) => {
+        return sum + coefficient * input[index];
+      }, 0);
     const positiveProbability = sigmoid(raw);
-    return probabilitiesByClass(model.classes, [1 - positiveProbability, positiveProbability]);
+    return probabilitiesByClass(model.classes, [
+      1 - positiveProbability,
+      positiveProbability,
+    ]);
   }
 
   const rawScores = model.coef.map((coefficients, classIndex) => {
-    return model.intercept[classIndex] + coefficients.reduce((sum, coefficient, featureIndex) => {
-      return sum + coefficient * input[featureIndex];
-    }, 0);
+    return (
+      model.intercept[classIndex] +
+      coefficients.reduce((sum, coefficient, featureIndex) => {
+        return sum + coefficient * input[featureIndex];
+      }, 0)
+    );
   });
   return probabilitiesByClass(model.classes, softmax(rawScores));
 }
 
 function gradientBoostingClassifierProbabilities(model, input) {
   if (model.classes.length === 2) {
-    const raw = model.initialRawPredictions[0] +
-      model.learningRate * model.trees.reduce((sum, tree) => sum + predictTree(tree, input), 0);
+    const raw =
+      model.initialRawPredictions[0] +
+      model.learningRate *
+        model.trees.reduce((sum, tree) => sum + predictTree(tree, input), 0);
     const positiveProbability = sigmoid(raw);
-    return probabilitiesByClass(model.classes, [1 - positiveProbability, positiveProbability]);
+    return probabilitiesByClass(model.classes, [
+      1 - positiveProbability,
+      positiveProbability,
+    ]);
   }
 
   const rawScores = [...model.initialRawPredictions];
@@ -578,7 +645,7 @@ function buildModelInput(model, taskType, summaryFeatures) {
   const values = [];
   const row = {
     taskType,
-    ...summaryFeatures
+    ...summaryFeatures,
   };
 
   if (model.categoricalFeatureColumns?.length) {
@@ -611,9 +678,10 @@ function predictTree(tree, input) {
 
   while (tree.childrenLeft[node] !== -1) {
     const featureIndex = tree.feature[node];
-    node = input[featureIndex] <= tree.threshold[node]
-      ? tree.childrenLeft[node]
-      : tree.childrenRight[node];
+    node =
+      input[featureIndex] <= tree.threshold[node]
+        ? tree.childrenLeft[node]
+        : tree.childrenRight[node];
   }
 
   return tree.value[node];
@@ -621,7 +689,10 @@ function predictTree(tree, input) {
 
 function probabilitiesByClass(classes, probabilities) {
   return Object.fromEntries(
-    classes.map((className, index) => [String(className), clampProbability(probabilities[index] ?? 0)])
+    classes.map((className, index) => [
+      String(className),
+      clampProbability(probabilities[index] ?? 0),
+    ]),
   );
 }
 
@@ -635,28 +706,43 @@ function normalizeProbabilities(values) {
 }
 
 function topProbabilityClass(probabilities) {
-  return Object.entries(probabilities).reduce((best, current) => {
-    return current[1] > best[1] ? current : best;
-  }, ["normal", -1])[0];
+  return Object.entries(probabilities).reduce(
+    (best, current) => {
+      return current[1] > best[1] ? current : best;
+    },
+    ["normal", -1],
+  )[0];
 }
 
 export function calculateExpressionVariables(blendshapes, options = {}) {
   const raw = calculateCalmBaselineValues(blendshapes);
   const smile = adjustForCalmBaseline("smile", raw.smile, options.calmBaseline);
-  const jawOpen = adjustForCalmBaseline("jawOpen", raw.jawOpen, options.calmBaseline);
+  const jawOpen = adjustForCalmBaseline(
+    "jawOpen",
+    raw.jawOpen,
+    options.calmBaseline,
+  );
   const browActivity = adjustForCalmBaseline(
     "browActivity",
     raw.browActivity,
-    options.calmBaseline
+    options.calmBaseline,
   );
   const mouthTension = adjustForCalmBaseline(
     "mouthTension",
     raw.mouthTension,
-    options.calmBaseline
+    options.calmBaseline,
   );
   const blink = adjustForCalmBaseline("blink", raw.blink, options.calmBaseline);
-  const asymmetry = adjustForCalmBaseline("asymmetry", raw.asymmetry, options.calmBaseline);
-  const browDown = adjustForCalmBaseline("browDown", raw.browDown, options.calmBaseline);
+  const asymmetry = adjustForCalmBaseline(
+    "asymmetry",
+    raw.asymmetry,
+    options.calmBaseline,
+  );
+  const browDown = adjustForCalmBaseline(
+    "browDown",
+    raw.browDown,
+    options.calmBaseline,
+  );
   const frameMotion = getFrameMotion(blendshapes);
   motionWindow.push(frameMotion);
   if (motionWindow.length > 24) {
@@ -664,15 +750,28 @@ export function calculateExpressionVariables(blendshapes, options = {}) {
   }
 
   const expressionActivity = clamp01(
-    smile * 0.3 + jawOpen * 0.2 + browActivity * 0.2 + blink * 0.12 + mouthTension * 0.18
+    smile * 0.3 +
+      jawOpen * 0.2 +
+      browActivity * 0.2 +
+      blink * 0.12 +
+      mouthTension * 0.18,
   );
   const motionAverage = average(motionWindow);
 
   const stillness = 1 - clamp01(motionAverage / 0.035);
-  const tensionSignal = clamp01(mouthTension * 0.65 + browDown * 0.2 + asymmetry * 0.15);
-  const baselineRigidity = Math.round(clamp01(stillness * 0.58 + tensionSignal * 0.42) * 100);
+  const tensionSignal = clamp01(
+    mouthTension * 0.65 + browDown * 0.2 + asymmetry * 0.15,
+  );
+  const baselineRigidity = Math.round(
+    clamp01(stillness * 0.58 + tensionSignal * 0.42) * 100,
+  );
   const baselineNaturalness = Math.round(
-    clamp01(0.72 - baselineRigidity / 170 + expressionActivity * 0.28 - asymmetry * 0.18) * 100
+    clamp01(
+      0.72 -
+        baselineRigidity / 170 +
+        expressionActivity * 0.28 -
+        asymmetry * 0.18,
+    ) * 100,
   );
 
   previousBlendshapeMap = blendshapes;
@@ -688,7 +787,7 @@ export function calculateExpressionVariables(blendshapes, options = {}) {
     blink: round(blink),
     smile: round(smile),
     jawOpen: round(jawOpen),
-    browActivity: round(browActivity)
+    browActivity: round(browActivity),
   };
 }
 
@@ -698,25 +797,31 @@ function calculateCalmBaselineValues(blendshapes) {
   const jawOpen = score(blendshapes, "jawOpen");
   const mouthPress = average([
     score(blendshapes, "mouthPressLeft"),
-    score(blendshapes, "mouthPressRight")
+    score(blendshapes, "mouthPressRight"),
   ]);
   const mouthPucker = score(blendshapes, "mouthPucker");
   const mouthFunnel = score(blendshapes, "mouthFunnel");
   const browUp = score(blendshapes, "browInnerUp");
   const browDown = average([
     score(blendshapes, "browDownLeft"),
-    score(blendshapes, "browDownRight")
+    score(blendshapes, "browDownRight"),
   ]);
   const eyeBlinkLeft = score(blendshapes, "eyeBlinkLeft");
   const eyeBlinkRight = score(blendshapes, "eyeBlinkRight");
 
   const smile = average([smileLeft, smileRight]);
   const blink = average([eyeBlinkLeft, eyeBlinkRight]);
-  const mouthTension = clamp01(mouthPress * 0.75 + mouthPucker * 0.15 + mouthFunnel * 0.1);
+  const mouthTension = clamp01(
+    mouthPress * 0.75 + mouthPucker * 0.15 + mouthFunnel * 0.1,
+  );
   const asymmetry = clamp01(
     Math.abs(smileLeft - smileRight) * 0.55 +
       Math.abs(eyeBlinkLeft - eyeBlinkRight) * 0.25 +
-      Math.abs(score(blendshapes, "browOuterUpLeft") - score(blendshapes, "browOuterUpRight")) * 0.2
+      Math.abs(
+        score(blendshapes, "browOuterUpLeft") -
+          score(blendshapes, "browOuterUpRight"),
+      ) *
+        0.2,
   );
   const browActivity = clamp01(browUp * 0.55 + browDown * 0.45);
 
@@ -727,7 +832,7 @@ function calculateCalmBaselineValues(blendshapes) {
     mouthTension,
     blink,
     asymmetry,
-    browDown
+    browDown,
   };
 }
 
@@ -738,17 +843,27 @@ function updateCalmBaseline(values) {
   }
 
   calmBaseline = Object.fromEntries(
-    CALM_BASELINE_KEYS.map((key) => [key, average(calmBaselineSamples.map((sample) => sample[key] ?? 0))])
+    CALM_BASELINE_KEYS.map((key) => [
+      key,
+      average(calmBaselineSamples.map((sample) => sample[key] ?? 0)),
+    ]),
+  );
+
+  const elapsed = performance.now() - calmBaselineStartTime;
+  const elapsedSeconds = Math.min(
+    CALM_BASELINE_DURATION_MS / 1000,
+    elapsed / 1000,
   );
 
   if (hasCalmBaseline()) {
     isCollectingNeutralBaseline = false;
     if (selectedTaskType === NEUTRAL_BASELINE_TASK_TYPE) {
       selectTaskType("natural_smile");
-      statusElement.textContent = "얼굴 기준값이 잡혔습니다. 분석할 표정을 선택하세요.";
+      statusElement.textContent =
+        "얼굴 기준값이 잡혔습니다. 분석할 표정을 선택하세요.";
     }
   } else {
-    statusElement.textContent = `무표정 기준값을 잡는 중입니다. ${calmBaselineSamples.length}/${CALM_BASELINE_MIN_SAMPLES}`;
+    statusElement.textContent = `무표정 기준값을 잡는 중입니다. ${elapsedSeconds.toFixed(1)}/${(CALM_BASELINE_DURATION_MS / 1000).toFixed(0)}초`;
   }
 
   updateTaskNavigation();
@@ -764,7 +879,11 @@ function adjustForCalmBaseline(key, value, baseline) {
 }
 
 function hasCalmBaseline() {
-  return Boolean(calmBaseline && calmBaselineSamples.length >= CALM_BASELINE_MIN_SAMPLES);
+  return Boolean(
+    calmBaseline &&
+    calmBaselineSamples.length >= CALM_BASELINE_MIN_SAMPLES &&
+    performance.now() - calmBaselineStartTime >= CALM_BASELINE_DURATION_MS,
+  );
 }
 
 function updateTaskNavigation() {
@@ -772,9 +891,16 @@ function updateTaskNavigation() {
   taskTabContainer.classList.toggle("is-baseline-mode", !baselineReady);
 
   taskButtons.forEach((button) => {
-    const isBaselineTask = button.dataset.taskType === NEUTRAL_BASELINE_TASK_TYPE;
-    button.classList.toggle("is-hidden", baselineReady ? isBaselineTask : !isBaselineTask);
-    button.classList.toggle("is-active", button.dataset.taskType === selectedTaskType);
+    const isBaselineTask =
+      button.dataset.taskType === NEUTRAL_BASELINE_TASK_TYPE;
+    button.classList.toggle(
+      "is-hidden",
+      baselineReady ? isBaselineTask : !isBaselineTask,
+    );
+    button.classList.toggle(
+      "is-active",
+      button.dataset.taskType === selectedTaskType,
+    );
   });
 }
 
@@ -796,17 +922,23 @@ function getFrameMotion(blendshapes) {
     "eyeBlinkLeft",
     "eyeBlinkRight",
     "cheekSquintLeft",
-    "cheekSquintRight"
+    "cheekSquintRight",
   ];
 
   return average(
-    trackedKeys.map((key) => Math.abs(score(blendshapes, key) - score(previousBlendshapeMap, key)))
+    trackedKeys.map((key) =>
+      Math.abs(score(blendshapes, key) - score(previousBlendshapeMap, key)),
+    ),
   );
 }
 
 function updateMetrics(variables) {
-  snapshotButton.disabled = false;
-  recordButton.disabled = false;
+  if (snapshotButton) {
+    snapshotButton.disabled = false;
+  }
+  if (recordButton) {
+    recordButton.disabled = false;
+  }
   ui.activity.textContent = variables.expressionActivity.toFixed(3);
   ui.motion.textContent = variables.motionAverage.toFixed(3);
   ui.asymmetry.textContent = variables.asymmetry.toFixed(3);
@@ -821,8 +953,12 @@ function resetMetrics() {
   ui.asymmetry.textContent = "--";
   ui.mouthTension.textContent = "--";
   ui.blink.textContent = "--";
-  snapshotButton.disabled = true;
-  recordButton.disabled = !isRecording;
+  if (snapshotButton) {
+    snapshotButton.disabled = true;
+  }
+  if (recordButton) {
+    recordButton.disabled = !isRecording;
+  }
 
   if (isAnalyzing) {
     updateAnalysisWithoutSample();
@@ -849,7 +985,9 @@ function resetExpressionState() {
 function toggleRecording() {
   if (isRecording) {
     isRecording = false;
-    recordButton.textContent = "연속 수집";
+    if (recordButton) {
+      recordButton.textContent = "연속 수집";
+    }
     updateCollectorState();
     return;
   }
@@ -861,7 +999,9 @@ function toggleRecording() {
 
   isRecording = true;
   lastSampleTime = 0;
-  recordButton.textContent = "수집 중지";
+  if (recordButton) {
+    recordButton.textContent = "수집 중지";
+  }
   updateCollectorState();
 }
 
@@ -869,12 +1009,14 @@ function collectSample() {
   const targets = getTargets();
 
   if (!latestVariables || !targets) {
-    statusElement.textContent = "얼굴 인식 후 자연도/경직도 라벨을 0-100으로 입력하세요.";
+    statusElement.textContent =
+      "얼굴 인식 후 자연도/경직도 라벨을 0-100으로 입력하세요.";
     return;
   }
 
   if (!hasCalmBaseline()) {
-    statusElement.textContent = "먼저 무표정으로 얼굴 기준값을 잡은 뒤 수집하세요.";
+    statusElement.textContent =
+      "먼저 무표정으로 얼굴 기준값을 잡은 뒤 수집하세요.";
     return;
   }
 
@@ -882,7 +1024,7 @@ function collectSample() {
     sampleId: datasetRows.length + 1,
     timestampIso: new Date().toISOString(),
     targetNaturalness: targets.targetNaturalness,
-    targetRigidity: targets.targetRigidity
+    targetRigidity: targets.targetRigidity,
   };
 
   FEATURE_KEYS.forEach((key) => {
@@ -896,7 +1038,14 @@ function collectSample() {
 }
 
 function getTargets() {
-  if (!naturalnessTargetInput.value.trim() || !rigidityTargetInput.value.trim()) {
+  if (!naturalnessTargetInput || !rigidityTargetInput) {
+    return null;
+  }
+
+  if (
+    !naturalnessTargetInput.value.trim() ||
+    !rigidityTargetInput.value.trim()
+  ) {
     return null;
   }
 
@@ -918,15 +1067,23 @@ function getTargets() {
 
   return {
     targetNaturalness,
-    targetRigidity
+    targetRigidity,
   };
 }
 
 function updateCollectorState() {
-  ui.sampleCount.textContent = String(datasetRows.length);
-  ui.recordState.textContent = isRecording ? "수집" : "대기";
-  downloadButton.disabled = datasetRows.length === 0;
-  clearButton.disabled = datasetRows.length === 0;
+  if (ui.sampleCount) {
+    ui.sampleCount.textContent = String(datasetRows.length);
+  }
+  if (ui.recordState) {
+    ui.recordState.textContent = isRecording ? "수집" : "대기";
+  }
+  if (downloadButton) {
+    downloadButton.disabled = datasetRows.length === 0;
+  }
+  if (clearButton) {
+    clearButton.disabled = datasetRows.length === 0;
+  }
 }
 
 function downloadCsv() {
@@ -934,12 +1091,22 @@ function downloadCsv() {
     return;
   }
 
-  const headers = ["sampleId", "timestampIso", "targetNaturalness", "targetRigidity", ...FEATURE_KEYS];
+  const headers = [
+    "sampleId",
+    "timestampIso",
+    "targetNaturalness",
+    "targetRigidity",
+    ...FEATURE_KEYS,
+  ];
   const csvRows = [
     headers.join(","),
-    ...datasetRows.map((row) => headers.map((header) => csvCell(row[header])).join(","))
+    ...datasetRows.map((row) =>
+      headers.map((header) => csvCell(row[header])).join(","),
+    ),
   ];
-  const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8" });
+  const blob = new Blob([csvRows.join("\n")], {
+    type: "text/csv;charset=utf-8",
+  });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -951,7 +1118,9 @@ function downloadCsv() {
 function clearDataset() {
   datasetRows.length = 0;
   isRecording = false;
-  recordButton.textContent = "연속 수집";
+  if (recordButton) {
+    recordButton.textContent = "연속 수집";
+  }
   updateCollectorState();
 }
 
@@ -1065,36 +1234,79 @@ export function summarizeFrameVariables(frameRows) {
   return summary;
 }
 
+// negativePatternScore: 100 = 부정패턴 없음(좋음), 0 = 부정패턴 강함(나쁨)
 export function calculateFinalNaturalnessScore(
   taskType,
-  predictedTaskPerformanceScore,
-  predictedNegativeExpressionScore
+  taskPerformanceScore,
+  negativePatternScore,
 ) {
   if (!POSITIVE_TASK_TYPES.includes(taskType)) {
     return null;
   }
 
   return Math.round(
-    clampScore(predictedTaskPerformanceScore * 0.7 + (100 - predictedNegativeExpressionScore) * 0.3)
+    clampScore(taskPerformanceScore * 0.6 + negativePatternScore * 0.4),
   );
+}
+
+export function calculateNegativePatternScore(summaryFeatures) {
+  // 학습된 이진 분류기 사용 (어색한표정/과하게웃는표정 = 1)
+  if (browserModels?.negativePatternModel) {
+    const probs = predictClassifierProbabilities(
+      browserModels.negativePatternModel,
+      {
+        taskType: selectedTaskType,
+        summaryFeatures,
+      },
+    );
+    const negativeProbability = Number(probs["1"] ?? 0);
+    return Math.round(clampScore(100 * (1 - negativeProbability)));
+  }
+
+  // rule-based 폴백 (모델 없을 때)
+  const mean = (key) => Number(summaryFeatures?.[`mean_${key}`] ?? 0);
+  const asymmetrySignal = clamp01(mean("asymmetry") / 0.1);
+  const tensionSignal = clamp01(mean("mouthTension") / 0.25);
+  const rigidBlinkSignal = clamp01(Math.max(0, 0.06 - mean("blink")) / 0.06);
+  const awkwardPenalty = clamp01(
+    asymmetrySignal * 0.4 + tensionSignal * 0.4 + rigidBlinkSignal * 0.2,
+  );
+  const overSmilePenalty = clamp01(Math.max(0, mean("smile") - 0.08) / 0.12);
+  const negativePenalty = clamp01(
+    awkwardPenalty * 0.5 + overSmilePenalty * 0.5,
+  );
+  return Math.round(clampScore(100 * (1 - negativePenalty)));
 }
 
 export function generateTaskFeedback({
   taskType,
   predictedScore,
+  taskScore,
+  negativePatternScore,
   naturalnessGrade,
-  summaryFeatures
+  summaryFeatures,
 }) {
   const messages = [];
   const mean = (key) => Number(summaryFeatures?.[`mean_${key}`] ?? 0);
   const std = (key) => Number(summaryFeatures?.[`std_${key}`] ?? 0);
 
-  if (naturalnessGrade) {
-    messages.push(`score 기준 등급은 ${formatGrade(naturalnessGrade)}입니다.`);
+  if (Number.isFinite(negativePatternScore) && negativePatternScore < 60) {
+    if (mean("asymmetry") > 0.07 || mean("mouthTension") > 0.2) {
+      messages.push(
+        "표정이 어색하게 굳어 있습니다. 긴장을 풀고 자연스럽게 표정을 지어보세요.",
+      );
+    }
+    if (mean("smile") > 0.12) {
+      messages.push(
+        "미소가 과하게 나타납니다. 좀 더 자연스러운 미소를 지어보세요.",
+      );
+    }
   }
 
   if (predictedScore < 55) {
-    messages.push("최종 자연스러움 score가 낮아 과제 수행 또는 부정 패턴 보정 측면의 개선이 필요합니다.");
+    messages.push(
+      "최종 자연스러움 score가 낮아 과제 수행 또는 부정 패턴 보정 측면의 개선이 필요합니다.",
+    );
   }
 
   if (taskType === "natural_smile") {
@@ -1103,38 +1315,53 @@ export function generateTaskFeedback({
     if (mean("smile") < thresholds.weakSmileMax) {
       messages.push("입꼬리 움직임이 부족해 미소가 약하게 보일 수 있습니다.");
     }
-    if (mean("blink") < thresholds.lowEyeBlinkMax && mean("browActivity") < thresholds.lowEyeBrowMax) {
+    if (
+      mean("blink") < thresholds.lowEyeBlinkMax &&
+      mean("browActivity") < thresholds.lowEyeBrowMax
+    ) {
       messages.push("눈가 움직임이 적어 다소 딱딱한 미소로 보일 수 있습니다.");
     }
     if (mean("asymmetry") > thresholds.asymmetryHigh) {
       messages.push("좌우 미소 균형이 불안정해 어색하게 보일 수 있습니다.");
     }
     if (mean("mouthTension") > thresholds.mouthTensionHigh) {
-      messages.push("입 주변 긴장도가 높아 자연스러운 미소보다 굳은 표정으로 보일 수 있습니다.");
+      messages.push(
+        "입 주변 긴장도가 높아 자연스러운 미소보다 굳은 표정으로 보일 수 있습니다.",
+      );
     }
   } else if (taskType === "listening") {
     const thresholds = FEEDBACK_THRESHOLDS.listening;
 
     if (std("expressionActivity") > thresholds.restlessExpressionStdHigh) {
-      messages.push("표정 변화가 커서 안정적인 경청 표정보다 산만해 보일 수 있습니다.");
+      messages.push(
+        "표정 변화가 커서 안정적인 경청 표정보다 산만해 보일 수 있습니다.",
+      );
     }
     if (mean("smile") > thresholds.overSmileHigh) {
-      messages.push("미소가 과하게 나타나 경청 표정보다는 웃는 표정에 가깝게 보일 수 있습니다.");
+      messages.push(
+        "미소가 과하게 나타나 경청 표정보다는 웃는 표정에 가깝게 보일 수 있습니다.",
+      );
     }
     if (mean("mouthTension") > thresholds.mouthTensionHigh) {
       messages.push("입 주변 긴장도가 높아 다소 굳어 보일 수 있습니다.");
     }
     if (mean("blink") < thresholds.lowBlinkMax) {
-      messages.push("눈가 움직임이 너무 적으면 반응이 부족해 보일 수 있습니다.");
+      messages.push(
+        "눈가 움직임이 너무 적으면 반응이 부족해 보일 수 있습니다.",
+      );
     }
     if (mean("jawOpen") > thresholds.jawOpenHigh) {
-      messages.push("입이 벌어진 시간이 길어 경청 표정보다 말하거나 놀란 표정에 가깝게 보일 수 있습니다.");
+      messages.push(
+        "입이 벌어진 시간이 길어 경청 표정보다 말하거나 놀란 표정에 가깝게 보일 수 있습니다.",
+      );
     }
   } else if (taskType === "calm") {
     const thresholds = FEEDBACK_THRESHOLDS.calm;
 
     if (mean("mouthTension") > thresholds.mouthTensionHigh) {
-      messages.push("입 주변 긴장도가 높아 차분하기보다 굳어 보일 수 있습니다.");
+      messages.push(
+        "입 주변 긴장도가 높아 차분하기보다 굳어 보일 수 있습니다.",
+      );
     }
     if (mean("browActivity") > thresholds.browActivityHigh) {
       messages.push("눈썹 움직임이 많아 불안정한 인상으로 보일 수 있습니다.");
@@ -1146,14 +1373,16 @@ export function generateTaskFeedback({
       mean("expressionActivity") > thresholds.expressionActivityHigh ||
       std("frameMotion") > thresholds.frameMotionStdHigh
     ) {
-      messages.push("표정 변화가 지나치게 크면 차분한 기본 표정과 다르게 보일 수 있습니다.");
+      messages.push(
+        "표정 변화가 지나치게 크면 차분한 기본 표정과 다르게 보일 수 있습니다.",
+      );
     }
-  } else if (taskType === "awkward" || taskType === "over_smile") {
-    messages.push("awkward와 over_smile은 어색한표정과 과하게웃는표정 부정 패턴 계열입니다.");
   }
 
   if (!messages.length && Number.isFinite(predictedScore)) {
-    messages.push("현재 표정은 선택한 과제와 비교적 잘 맞는 score로 예측되었습니다.");
+    messages.push(
+      "현재 표정은 선택한 과제와 비교적 잘 맞는 score로 예측되었습니다.",
+    );
   }
 
   return messages.slice(0, 4);

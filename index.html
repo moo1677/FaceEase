@@ -28,10 +28,26 @@
           <p id="status">모델을 불러오는 중...</p>
 
           <div class="task-tabs" role="group" aria-label="표정 과제 선택">
-            <button class="task-tab is-active" type="button" data-task-type="neutral_baseline">무표정</button>
-            <button class="task-tab" type="button" data-task-type="natural_smile">미소</button>
-            <button class="task-tab" type="button" data-task-type="listening">경청</button>
-            <button class="task-tab" type="button" data-task-type="calm">차분</button>
+            <button
+              class="task-tab is-active"
+              type="button"
+              data-task-type="neutral_baseline"
+            >
+              무표정
+            </button>
+            <button
+              class="task-tab"
+              type="button"
+              data-task-type="natural_smile"
+            >
+              미소
+            </button>
+            <button class="task-tab" type="button" data-task-type="listening">
+              경청
+            </button>
+            <button class="task-tab" type="button" data-task-type="calm">
+              차분
+            </button>
           </div>
 
           <div class="task-card">
@@ -39,28 +55,31 @@
             <strong id="taskPrompt">무표정으로 얼굴 기준값을 잡아주세요</strong>
           </div>
 
-          <button id="analyzeButton" class="primary-action" type="button" disabled>5초 분석 시작</button>
+          <button
+            id="analyzeButton"
+            class="primary-action"
+            type="button"
+            disabled
+          >
+            5초 분석 시작
+          </button>
 
           <div class="score-grid">
             <div class="grade-card">
-              <span>score 등급</span>
+              <span>최종 등급</span>
               <strong id="naturalnessGrade" class="grade-result">--</strong>
             </div>
             <div>
-              <span>예측 score</span>
+              <span>최종 점수</span>
               <strong id="naturalnessScore">--</strong>
             </div>
             <div>
-              <span>학습 target</span>
+              <span>과제수행 점수</span>
               <strong id="taskScore">--</strong>
             </div>
             <div>
-              <span>taskType 계열</span>
+              <span>표정 안정도</span>
               <strong id="negativeScore">--</strong>
-            </div>
-            <div>
-              <span>선택 모델</span>
-              <strong id="negativePatternProbability">--</strong>
             </div>
             <div>
               <span>샘플</span>
@@ -74,65 +93,8 @@
               <li>분석 결과가 여기에 표시됩니다.</li>
             </ul>
           </div>
-
-          <dl class="variable-list">
-            <div>
-              <dt>표정 활성도</dt>
-              <dd id="activityValue">--</dd>
-            </div>
-            <div>
-              <dt>움직임</dt>
-              <dd id="motionValue">--</dd>
-            </div>
-            <div>
-              <dt>좌우 비대칭</dt>
-              <dd id="asymmetryValue">--</dd>
-            </div>
-            <div>
-              <dt>입 긴장</dt>
-              <dd id="mouthTensionValue">--</dd>
-            </div>
-            <div>
-              <dt>눈 깜빡임</dt>
-              <dd id="blinkValue">--</dd>
-            </div>
-          </dl>
         </aside>
       </section>
-
-      <details class="collector-panel">
-        <summary>라벨 수집 패널</summary>
-        <div class="collector-layout">
-          <div class="score-grid">
-            <div>
-              <span>수집 샘플</span>
-              <strong id="sampleCount">0</strong>
-            </div>
-            <div>
-              <span>현재 상태</span>
-              <strong id="recordState">대기</strong>
-            </div>
-          </div>
-
-          <form class="label-form" id="labelForm">
-            <label>
-              자연도 라벨
-              <input id="naturalnessTarget" type="number" min="0" max="100" step="1" placeholder="0-100" />
-            </label>
-            <label>
-              경직도 라벨
-              <input id="rigidityTarget" type="number" min="0" max="100" step="1" placeholder="0-100" />
-            </label>
-          </form>
-
-          <div class="collector-actions">
-            <button id="snapshotButton" type="button" disabled>샘플 1개 저장</button>
-            <button id="recordButton" type="button" disabled>연속 수집</button>
-            <button id="downloadButton" type="button" disabled>CSV 다운로드</button>
-            <button id="clearButton" type="button" disabled>초기화</button>
-          </div>
-        </div>
-      </details>
     </main>
     <script type="module" src="/src/main.js"></script>
   </body>

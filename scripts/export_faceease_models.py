@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCORE_MODEL = ROOT / "output" / "faceease_score_model.pkl"
+DEFAULT_NEGATIVE_PATTERN_MODEL = ROOT / "output" / "faceease_negative_pattern_model.pkl"
 DEFAULT_OUTPUT = ROOT / "public" / "models" / "faceease_models.json"
 
 
@@ -81,9 +83,89 @@ def export_regression_tree(tree: Any) -> dict[str, Any]:
     }
 
 
+def export_classifier_tree(tree: Any, n_classes: int) -> dict[str, Any]:
+    # value shape: (node_count, 1, n_classes) → (node_count, n_classes)
+    values = tree.value.reshape(tree.node_count, n_classes)
+    return {
+        "childrenLeft": tree.children_left.tolist(),
+        "childrenRight": tree.children_right.tolist(),
+        "feature": tree.feature.tolist(),
+        "threshold": tree.threshold.tolist(),
+        "value": values.tolist(),
+    }
+
+
+def export_classifier_bundle(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+
+    bundle = joblib.load(path)
+    pipeline = bundle["model"]
+    preprocessor = pipeline.named_steps["preprocess"]
+    model = pipeline.named_steps["model"]
+
+    classes = [str(c) for c in bundle["classes"]]
+    n_classes = len(classes)
+
+    exported: dict[str, Any] = {
+        "modelName": bundle["modelName"],
+        "target": bundle["target"],
+        "classes": classes,
+        "featureColumns": bundle["featureColumns"],
+        "inputColumns": bundle["inputColumns"],
+        "selectedMetrics": bundle["selectedMetrics"],
+    }
+
+    # 분류기 preprocessor는 "features" 이름의 StandardScaler 하나
+    transformers = dict(preprocessor.named_transformers_)
+    if "features" in transformers:
+        scaler = transformers["features"]
+        exported["featureScaler"] = {
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+        }
+
+    model_name = bundle["modelName"]
+
+    if model_name == "LogisticRegression":
+        exported["kind"] = "logisticClassifier"
+        exported["coef"] = model.coef_.tolist()
+        exported["intercept"] = model.intercept_.tolist()
+    elif model_name == "RandomForestClassifier":
+        exported["kind"] = "randomForestClassifier"
+        exported["trees"] = [
+            export_classifier_tree(est.tree_, n_classes)
+            for est in model.estimators_
+        ]
+    elif model_name == "GradientBoostingClassifier":
+        exported["kind"] = "gradientBoostingClassifier"
+        exported["learningRate"] = float(model.learning_rate)
+        if n_classes == 2:
+            p = float(np.clip(model.init_.class_prior_[1], 1e-7, 1 - 1e-7))
+            exported["initialRawPredictions"] = [float(np.log(p / (1 - p)))]
+            exported["trees"] = [
+                export_regression_tree(est[0].tree_)
+                for est in model.estimators_
+            ]
+        else:
+            exported["initialRawPredictions"] = [
+                float(np.log(np.clip(p, 1e-7, 1 - 1e-7)))
+                for p in model.init_.class_prior_
+            ]
+            exported["trees"] = [
+                [export_regression_tree(est.tree_) for est in stage]
+                for stage in model.estimators_
+            ]
+    else:
+        raise ValueError(f"Unsupported classifier for browser export: {model_name}")
+
+    return exported
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export the trained FaceEase score model to browser JSON.")
+    parser = argparse.ArgumentParser(description="Export the trained FaceEase models to browser JSON.")
     parser.add_argument("--score-model", type=Path, default=DEFAULT_SCORE_MODEL)
+    parser.add_argument("--negative-pattern-model", type=Path, default=DEFAULT_NEGATIVE_PATTERN_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args()
 
@@ -91,15 +173,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     score_model = export_bundle(args.score_model)
-    payload = {
+    payload: dict[str, Any] = {
         "version": "2026-06-08",
         "scoreModel": score_model,
         "selectedModel": score_model["modelName"],
         "selectedMetrics": score_model["selectedMetrics"],
     }
+
+    negative_pattern_model = export_classifier_bundle(args.negative_pattern_model)
+    if negative_pattern_model:
+        payload["negativePatternModel"] = negative_pattern_model
+        print(f"Exported negative pattern classifier: {negative_pattern_model['modelName']} ({negative_pattern_model['kind']})")
+    else:
+        print(f"No negative pattern model at {args.negative_pattern_model}, skipping.")
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    print(f"Exported browser score model to {args.output}")
+    print(f"Exported browser models to {args.output}")
 
 
 if __name__ == "__main__":
