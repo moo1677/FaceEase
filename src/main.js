@@ -107,6 +107,9 @@ const TASK_PROMPTS = {
   listening: "경청하는 표정을 지어보세요",
   calm: "차분한 표정을 지어보세요",
 };
+const HAS_VIDEO_FRAME_CALLBACK =
+  typeof HTMLVideoElement !== "undefined" &&
+  "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
 const ui = {
   sampleCount: document.querySelector("#sampleCount"),
@@ -121,7 +124,7 @@ const ui = {
 let faceLandmarker;
 let drawingUtils;
 let isRunning = false;
-let lastVideoTime = -1;
+let lastDetectionTimestamp = -1;
 let lastConsoleTime = 0;
 let lastSampleTime = 0;
 let latestVariables = null;
@@ -223,11 +226,12 @@ async function startCamera() {
     resizeCanvasToVideo();
 
     isRunning = true;
+    lastDetectionTimestamp = -1;
     startButton.disabled = true;
     statusElement.textContent =
       "무표정 버튼을 눌러 얼굴 기준값 수집을 시작하세요.";
     updateServiceControls();
-    requestAnimationFrame(renderLoop);
+    scheduleRenderLoop();
     return true;
   } catch (error) {
     console.error("카메라 시작 실패:", error);
@@ -236,24 +240,65 @@ async function startCamera() {
   }
 }
 
-function renderLoop() {
+function scheduleRenderLoop() {
+  if (!isRunning) {
+    return;
+  }
+
+  if (HAS_VIDEO_FRAME_CALLBACK) {
+    video.requestVideoFrameCallback(handleVideoFrame);
+    return;
+  }
+
+  requestAnimationFrame(renderLoop);
+}
+
+function handleVideoFrame(now, metadata) {
+  try {
+    detectCurrentFrame((metadata?.mediaTime ?? now / 1000) * 1000);
+  } finally {
+    scheduleRenderLoop();
+  }
+}
+
+function renderLoop(timestamp) {
+  try {
+    detectCurrentFrame(timestamp);
+  } finally {
+    scheduleRenderLoop();
+  }
+}
+
+function detectCurrentFrame(timestamp) {
   if (!isRunning) {
     return;
   }
 
   if (
     video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-    video.currentTime !== lastVideoTime
+    video.videoWidth &&
+    video.videoHeight
   ) {
-    lastVideoTime = video.currentTime;
     resizeCanvasToVideo();
 
-    const result = faceLandmarker.detectForVideo(video, performance.now());
+    const result = faceLandmarker.detectForVideo(
+      video,
+      getNextDetectionTimestamp(timestamp),
+    );
     drawResult(result);
     processResult(result);
   }
+}
 
-  requestAnimationFrame(renderLoop);
+function getNextDetectionTimestamp(timestamp) {
+  const nextTimestamp = Number.isFinite(timestamp)
+    ? timestamp
+    : performance.now();
+  lastDetectionTimestamp =
+    nextTimestamp > lastDetectionTimestamp
+      ? nextTimestamp
+      : lastDetectionTimestamp + 1;
+  return lastDetectionTimestamp;
 }
 
 function resizeCanvasToVideo() {
@@ -939,20 +984,20 @@ function updateMetrics(variables) {
   if (recordButton) {
     recordButton.disabled = false;
   }
-  ui.activity.textContent = variables.expressionActivity.toFixed(3);
-  ui.motion.textContent = variables.motionAverage.toFixed(3);
-  ui.asymmetry.textContent = variables.asymmetry.toFixed(3);
-  ui.mouthTension.textContent = variables.mouthTension.toFixed(3);
-  ui.blink.textContent = variables.blink.toFixed(3);
+  setMetricText(ui.activity, variables.expressionActivity.toFixed(3));
+  setMetricText(ui.motion, variables.motionAverage.toFixed(3));
+  setMetricText(ui.asymmetry, variables.asymmetry.toFixed(3));
+  setMetricText(ui.mouthTension, variables.mouthTension.toFixed(3));
+  setMetricText(ui.blink, variables.blink.toFixed(3));
 }
 
 function resetMetrics() {
   resetExpressionState();
-  ui.activity.textContent = "--";
-  ui.motion.textContent = "--";
-  ui.asymmetry.textContent = "--";
-  ui.mouthTension.textContent = "--";
-  ui.blink.textContent = "--";
+  setMetricText(ui.activity, "--");
+  setMetricText(ui.motion, "--");
+  setMetricText(ui.asymmetry, "--");
+  setMetricText(ui.mouthTension, "--");
+  setMetricText(ui.blink, "--");
   if (snapshotButton) {
     snapshotButton.disabled = true;
   }
@@ -962,6 +1007,12 @@ function resetMetrics() {
 
   if (isAnalyzing) {
     updateAnalysisWithoutSample();
+  }
+}
+
+function setMetricText(element, value) {
+  if (element) {
+    element.textContent = value;
   }
 }
 
